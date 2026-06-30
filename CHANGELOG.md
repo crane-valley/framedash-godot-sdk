@@ -6,6 +6,19 @@ follows [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-06-30
+
+- Automated profiling sessions for CI: `BeginAutomatedSession(buildId, branch,
+  commit, scenario)` (and `BeginAutomatedSessionFromEnvironment()`, which reads the
+  `FRAMEDASH_BUILD_ID` / `FRAMEDASH_GIT_BRANCH` / `FRAMEDASH_GIT_COMMIT` /
+  `FRAMEDASH_TEST_SCENARIO` environment variables) tag every subsequent event with
+  CI metadata so build-over-build performance can be compared in the dashboard and
+  via `framedash perf-diff`. The build id is stamped as the first-class `build_id`
+  field; branch, commit, and scenario ride in the existing attributes map as
+  `ci.branch` / `ci.commit` / `ci.scenario` (no proto change). `EndAutomatedSession()`
+  stops the tagging. The session tags merge into every event -- including the
+  automatic `perf_heartbeat` that carries the performance metrics -- and a per-event
+  attribute with the same key overrides the session value.
 - Centralize per-event field clamping into a shared `FieldClamp` helper (parity
   with the Unity and UE5 SDKs): event name, map_id, build_id, position,
   platform, engine_version, and attribute/metric caps are all clamped to the

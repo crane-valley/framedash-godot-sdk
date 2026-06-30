@@ -43,7 +43,7 @@ namespace Framedash
         [Export] public string EndpointUrl { get; set; } = "https://ingest.framedash.dev/v1/events";
         [Export] public string ApiKey { get; set; } = "";
         [Export] public string BuildId { get; set; } = "";
-        [Export] public string SdkVersion { get; set; } = "0.1.0";
+        [Export] public string SdkVersion { get; set; } = "0.1.1";
         private string _playerId = "";
         [Export]
         public string PlayerId
@@ -119,6 +119,10 @@ namespace Framedash
         private bool _warnedEmptyPlayerId;
         private string _cachedPlatform;
         private string _cachedEngineVersion;
+        // The automated-session (CI) build_id override and ci.* attributes live together in
+        // the SessionManager as one immutable snapshot (see SessionManager.ResolveSessionStamp),
+        // so the public [Export] BuildId property is never overwritten and the stamping path
+        // reads the build_id and the tags from a single consistent point.
         // Camera yaw/pitch sampled once per frame (_Process) and stamped onto events,
         // mirroring the per-frame performance cache. Packed into one long and
         // published/read atomically so the (yaw, pitch) pair is always observed
@@ -391,6 +395,9 @@ namespace Framedash
             // New generation: a stale FlushAsync completion from a prior session will not
             // release this session's flush guard (see FlushAsync).
             _flushGeneration++;
+            // A fresh session owns no automated-session state: the SessionManager (which holds
+            // the build_id override + ci.* snapshot) is recreated below, so a prior Begin
+            // without an End cannot keep stamping events under the candidate build.
             // Pass 'this' as the owning Node so the transport can issue HTTP requests
             // through Godot's HTTPRequest node lifecycle.
             _transport = new TransportLayer(this, EndpointUrl, ApiKey, SdkVersion, maxPayloadBytes);
@@ -612,6 +619,12 @@ namespace Framedash
                 camPitch = unpackedPitch;
             }
 
+            // Resolve the CI session against this event from a SINGLE snapshot read, so the
+            // stamped build_id and the merged ci.* attributes are always mutually consistent
+            // even if Begin/EndAutomatedSession runs on the main thread while this Track()
+            // executes on a background thread.
+            var ciStamp = _session.ResolveSessionStamp(BuildId, attributes);
+
             var evt = new TelemetryEvent
             {
                 EventName = eventName,
@@ -629,10 +642,18 @@ namespace Framedash
                 MemoryUsedBytes = perf.MemoryUsedBytes,
                 GpuTimeMs = perf.GpuTimeMs,
                 Source = source,
-                BuildId = FieldClamp.Truncate(BuildId ?? "", FieldClamp.MaxBuildIdLength),
+                // The automated-session build_id override (CI) when active, else the
+                // configured BuildId -- resolved above. The public BuildId is never
+                // overwritten, so a re-init or a direct BuildId change can never strand a
+                // candidate id.
+                BuildId = FieldClamp.Truncate(ciStamp.BuildId ?? "", FieldClamp.MaxBuildIdLength),
                 Platform = _cachedPlatform,
                 EngineVersion = _cachedEngineVersion,
-                Attributes = attributes,
+                // The active automated-session attributes (CI metadata) merged with the
+                // per-event ones -- from the same snapshot as BuildId -- so every event,
+                // including the perf_heartbeat that feeds perf-diff, is tagged. No session
+                // active -> the per-event list unchanged.
+                Attributes = ciStamp.Attributes,
                 Metrics = metrics,
                 GameThreadMs = perf.GameThreadMs,
                 RenderThreadMs = perf.RenderThreadMs,
@@ -665,6 +686,107 @@ namespace Framedash
             // from the stale _playerId and silently revert to anonymous. Safe before init
             // (the value is applied when the session is created).
             PlayerId = playerId;
+        }
+
+        /// <summary>
+        /// Begin an automated profiling session: tag every subsequent event with CI
+        /// metadata so build-over-build performance can be compared in the dashboard and
+        /// via <c>framedash perf-diff</c>. <paramref name="buildId"/> is stamped as the
+        /// first-class build_id field; <paramref name="branch"/>, <paramref name="commit"/>
+        /// and <paramref name="scenario"/> are attached as the <c>ci.branch</c> /
+        /// <c>ci.commit</c> / <c>ci.scenario</c> attributes. Each call fully (re)defines the
+        /// session rather than patching it: an omitted (null/empty) buildId clears any prior
+        /// build_id override (events fall back to the configured BuildId) and an omitted
+        /// branch/commit/scenario is absent from the new tag set -- callers cannot
+        /// incrementally update metadata across calls. With all arguments empty this is a
+        /// no-op. Call once after Initialize(), before the profiling run. No-op if the SDK is
+        /// not initialized.
+        /// </summary>
+        public void BeginAutomatedSession(string buildId = null, string branch = null,
+            string commit = null, string scenario = null)
+        {
+            try
+            {
+                if (!_initialized)
+                {
+                    GD.PushWarning("[Framedash] SDK not initialized. Call Initialize() before BeginAutomatedSession().");
+                    return;
+                }
+                bool hasBuildId = !string.IsNullOrEmpty(buildId);
+                bool hasBranch = !string.IsNullOrEmpty(branch);
+                bool hasCommit = !string.IsNullOrEmpty(commit);
+                bool hasScenario = !string.IsNullOrEmpty(scenario);
+                // No metadata at all (e.g. BeginAutomatedSessionFromEnvironment with the
+                // FRAMEDASH_* vars unset) is a true no-op: do not start an override or touch
+                // session attributes, so a later End cannot clear state this call never set.
+                if (!hasBuildId && !hasBranch && !hasCommit && !hasScenario) return;
+                var attrs = new Dictionary<string, string>();
+                if (hasBranch) attrs["ci.branch"] = branch;
+                if (hasCommit) attrs["ci.commit"] = commit;
+                if (hasScenario) attrs["ci.scenario"] = scenario;
+                // Install the build_id override + ci.* attributes as one atomic snapshot. Each
+                // Begin fully (re)defines the session: a supplied buildId becomes the override,
+                // otherwise it is cleared back to the configured BuildId fallback -- the same
+                // replace-don't-merge semantics as the attributes, so no stale build_id leaks
+                // from a prior session.
+                _session.SetAutomatedSession(hasBuildId ? buildId : null, attrs);
+            }
+            catch (Exception e)
+            {
+                GD.PushError($"[Framedash] BeginAutomatedSession() failed: {e.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Begin an automated profiling session from the standard Framedash CI environment
+        /// variables: <c>FRAMEDASH_BUILD_ID</c>, <c>FRAMEDASH_GIT_BRANCH</c>,
+        /// <c>FRAMEDASH_GIT_COMMIT</c>, <c>FRAMEDASH_TEST_SCENARIO</c>. The planned
+        /// <c>framedash run-profile-test</c> runner will export these before launching the
+        /// game, so a CI integration needs only this one call in its automated-test entry
+        /// point. With none of the variables set this is a no-op (no override is started).
+        /// No-op if the SDK is not initialized.
+        /// </summary>
+        public void BeginAutomatedSessionFromEnvironment()
+        {
+            try
+            {
+                // Fully-qualify System.Environment: `using Godot;` also brings a
+                // Godot.Environment type into scope, so the bare name is ambiguous.
+                BeginAutomatedSession(
+                    System.Environment.GetEnvironmentVariable("FRAMEDASH_BUILD_ID"),
+                    System.Environment.GetEnvironmentVariable("FRAMEDASH_GIT_BRANCH"),
+                    System.Environment.GetEnvironmentVariable("FRAMEDASH_GIT_COMMIT"),
+                    System.Environment.GetEnvironmentVariable("FRAMEDASH_TEST_SCENARIO"));
+            }
+            catch (Exception e)
+            {
+                GD.PushError($"[Framedash] BeginAutomatedSessionFromEnvironment() failed: {e.Message}");
+            }
+        }
+
+        /// <summary>
+        /// End the automated profiling session: clear the <c>ci.*</c> session attributes set
+        /// by <see cref="BeginAutomatedSession"/> AND drop the automated-session build_id
+        /// override, so events emitted afterward carry the configured build_id again and are
+        /// no longer folded into the candidate build's perf diff. Call <see cref="Flush"/>
+        /// first if you want the buffered tagged events sent before the tags are cleared.
+        /// No-op if the SDK is not initialized.
+        /// </summary>
+        public void EndAutomatedSession()
+        {
+            try
+            {
+                if (!_initialized) return;
+                // One atomic clear: the build_id override and the ci.* attributes live in a
+                // single session snapshot, so a background Track() either sees the whole
+                // session or none of it -- a post-End event can never carry the candidate
+                // build_id with cleared tags.
+                _session.ClearSessionAttributes();
+            }
+            catch (Exception e)
+            {
+                GD.PushError($"[Framedash] EndAutomatedSession() failed: {e.Message}");
+            }
         }
 
         /// <summary>

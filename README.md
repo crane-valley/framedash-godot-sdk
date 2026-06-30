@@ -112,6 +112,55 @@ Automatic events (`session_start`, `perf_heartbeat`) bypass sampling.
 
 > **Configuration is code-first.** The plugin registers a *script* autoload, which Godot instantiates from `TelemetrySDK.cs` using the code defaults — its `[Export]` fields are **not** editable from Project Settings, so configure the SDK by calling `TelemetrySDK.Initialize(...)` (typically from an early `_Ready()`). The `[Export]` fields (API key, endpoint, sampling rate, capture-camera-rotation, etc.) become editable only if you instead add the `TelemetrySDK` script to a node in a scene you control (for example, your own autoload scene) and set them in the inspector there; if you set `ApiKey` that way, the node auto-initializes in `_Ready()` with no code.
 
+### 6. Automated profiling sessions (CI)
+
+For build-over-build performance gating, tag a run's events with build metadata
+so the dashboard and `framedash perf-diff` can compare one build against another.
+Call this once after `Initialize()` in your automated-test / profiling entry point:
+
+```csharp
+Framedash.TelemetrySDK.Instance.BeginAutomatedSession(
+    buildId:  commitSha,       // -> the first-class build_id field
+    branch:   "main",          // -> ci.branch attribute
+    commit:   commitSha,       // -> ci.commit attribute
+    scenario: "boot_to_menu"); // -> ci.scenario attribute
+
+// ... run the scenario; gameplay + perf_heartbeat events are now tagged ...
+
+Framedash.TelemetrySDK.Instance.Flush();
+Framedash.TelemetrySDK.Instance.EndAutomatedSession();
+```
+
+`branch`, `commit`, and `scenario` ride in the existing event `attributes` map
+(`ci.*`), so no schema change is required; the tags apply to every event,
+including the automatic `perf_heartbeat` that carries the frame-time / memory /
+GPU metrics. A per-event attribute with the same key overrides the session value.
+
+If your CI harness exports the standard Framedash variables (`FRAMEDASH_BUILD_ID`,
+`FRAMEDASH_GIT_BRANCH`, `FRAMEDASH_GIT_COMMIT`, `FRAMEDASH_TEST_SCENARIO`) -- the
+planned `framedash run-profile-test` runner will export these for you -- call the
+zero-argument overload instead:
+
+```csharp
+Framedash.TelemetrySDK.Instance.BeginAutomatedSessionFromEnvironment();
+```
+
+Then gate the build in CI with
+`framedash perf-diff --baseline <old_build_id> --candidate <new_build_id> --fail-on-regression`.
+
+Two things to know when wiring this into a real pipeline:
+
+- `build_id` is the dimension `perf-diff` compares. It groups and compares by
+  `build_id` (optionally narrowed by map/platform), not by `ci.scenario`, so two
+  scenarios under one `build_id` fold into a single aggregate. To compare
+  scenarios independently, give each its own `build_id` (for example
+  `<commit>-<scenario>`) and treat `ci.scenario` as a queryable label rather than
+  a `perf-diff` split key.
+- The `ci.*` tags live in the event `attributes` map, which COPPA-redacted
+  projects strip on ingest -- under COPPA only `build_id` survives. If you run
+  automated profiling on a COPPA project, make `build_id` carry everything the
+  comparison must distinguish.
+
 ## Local Development
 
 To point the Godot SDK at a local Framedash stack:
