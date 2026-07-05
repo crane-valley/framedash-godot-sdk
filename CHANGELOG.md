@@ -6,6 +6,26 @@ follows [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-07-05
+
+- Fix a first-flush race when the SDK node is auto-created: a synchronous
+  `Flush()` in the same frame as the first `TelemetrySDK.Instance` access (for
+  example inside `_Ready()`) could run before the deferred `AddChild` put the
+  node into the scene tree, so `HttpRequest` returned `ERR_UNCONFIGURED` and the
+  batch was silently dropped. The send path now waits (bounded by the existing
+  flush budget) for the owner node to enter the tree before dispatching, and the
+  retry backoff falls back to the main-loop `SceneTree` when the node is not yet
+  in a tree, so resumption stays on the Godot main thread.
+- `Shutdown()` called from a non-main thread is now marshaled to the main
+  thread (same as `Flush()`), so the final flush is no longer dropped when a
+  background thread shuts the SDK down.
+- Guard the send path against a freed owner node (`IsInstanceValid` checks
+  before and after each await), preventing `ObjectDisposedException` noise
+  during teardown.
+- A `Shutdown()` in the same frame as the auto-created node's `_Ready()` no
+  longer lets the deferred `_Ready` auto-init revive the shut-down instance and
+  dispose the transport under an in-flight flush.
+
 ## [0.1.2] - 2026-07-05
 
 - Prefer-IPv4-with-IPv6-fallback ingest connect (parity with the Unity SDK).

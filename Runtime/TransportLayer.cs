@@ -135,6 +135,21 @@ namespace Framedash
 				// was already logged once at construction; stay quiet here to avoid spam.
 				if (_disabled || events == null || events.Length == 0) return;
 
+				// The owner Node (and its HttpRequest child) must be inside the scene tree
+				// before RequestRaw, or Godot returns ERR_UNCONFIGURED and the batch is lost.
+				// When no plugin autoload is registered, the Instance getter auto-creates the
+				// SDK node and parents it via a DEFERRED AddChild (end-of-frame), so a
+				// synchronous first Flush() in the same _Ready() runs while the owner is still
+				// OUTSIDE the tree. Await the deferred entry once before issuing any request.
+				// Cheap no-op on the normal (autoload / already-in-tree) path and on the
+				// SplitAndResend recursion. Returns false only if the owner never enters the
+				// tree within the cap (flush abandoned, fail-safe -- never hangs the guard).
+				if (!await EnsureOwnerInTree(flushElapsed))
+				{
+					GD.PushError($"[Framedash] Owner node is not in the scene tree; dropping {events.Length} events.");
+					return;
+				}
+
 				// Shared flush budget: if an earlier chunk already spent the whole budget
 				// on a wedged endpoint, drop this chunk immediately rather than starting a
 				// fresh ladder. Those events are lost for this flush, but later flushes'
@@ -398,7 +413,7 @@ namespace Framedash
 				for (int i = 0; i < ResolveMaxPolls && (!done4 || !done6); i++)
 				{
 					// Yield to the main loop; resumes on a later frame WITHOUT freezing. If
-					// the owner left the tree, stop and use whatever resolved so far.
+					// there is no running main loop at all, stop and use whatever resolved so far.
 					if (!await WaitBackoff(ResolvePollSeconds)) break;
 					if (!done4) done4 = TryReadResolve(idv4, out ipv4);
 					if (!done6) done6 = TryReadResolve(idv6, out ipv6);
@@ -464,13 +479,60 @@ namespace Framedash
 			return delay < remaining ? delay : remaining;
 		}
 
+		// End-of-frame cap for awaiting the owner Node's tree entry before the first send.
+		// The auto-created node's deferred AddChild runs at the end of the current frame, so
+		// the first WaitBackoff yield is normally enough; the cap only bounds a pathological
+		// owner that never enters the tree so a flush cannot hang the single-flight guard
+		// forever. Reuses the DNS-resolve poll cadence (ResolvePollSeconds).
+		private const int TreeEntryMaxPolls = 60;
+
+		// Await the owner Node's scene-tree entry before the first send. When the SDK node was
+		// auto-created by the Instance getter (no plugin autoload registered), its AddChild is
+		// DEFERRED to end-of-frame, so a synchronous first Flush() in the same _Ready() runs
+		// while the owner -- and its HttpRequest child -- are still OUTSIDE the tree, where
+		// RequestRaw returns ERR_UNCONFIGURED and the batch is dropped. Poll until the deferred
+		// entry lands (event-free, reusing the out-of-tree-safe WaitBackoff so the yield resumes
+		// on the MAIN thread). Already-in-tree (autoload / recursion) returns immediately with no
+		// await -- the in-tree fast path stays zero-cost. Each poll is clamped to the remaining
+		// shared flush budget (CapToBudget) so a tight config (small HttpTimeoutSeconds/MaxRetries)
+		// cannot let the single-flight guard overrun, and a SplitAndResend chunk that finds the
+		// owner gone cannot re-pay a fresh poll ladder beyond the flush deadline. Returns false if
+		// the owner never entered the tree within the cap OR the budget is exhausted.
+		private async Task<bool> EnsureOwnerInTree(Stopwatch flushElapsed)
+		{
+			// The owner may have been freed (scene change / app exit) before or during the
+			// wait; IsInsideTree() on a freed object throws, so re-validate at the start and
+			// after every await before touching it. One cheap native check on the rare
+			// batch-send path -- nothing per-frame.
+			if (!GodotObject.IsInstanceValid(_owner)) return false;
+			if (_owner.IsInsideTree()) return true;
+			for (int i = 0; i < TreeEntryMaxPolls; i++)
+			{
+				float pollWait = CapToBudget(ResolvePollSeconds, flushElapsed);
+				if (pollWait <= 0f) return false;
+				if (!await WaitBackoff(pollWait)) return false;
+				if (!GodotObject.IsInstanceValid(_owner)) return false;
+				if (_owner.IsInsideTree()) return true;
+			}
+			// Loop exhausted without the owner entering the tree.
+			return false;
+		}
+
 		// Backoff wait that stays on the Godot MAIN thread: SceneTreeTimer + ToSignal
 		// resume on the main loop, unlike Task.Delay which resumes on a thread-pool
 		// thread and would make the next RequestRaw an unsafe off-main engine call.
-		// Returns false if the owner left the scene tree (no SceneTree) -> caller aborts.
+		// Prefer the owner's own tree, but fall back to the main-loop SceneTree when the
+		// owner is not (yet) inside the tree: the auto-create fallback (no plugin autoload)
+		// parents the SDK node via a DEFERRED AddChild, so during the same-frame first flush
+		// GetTree() is null -- bailing there would silently drop events, and the main-loop
+		// tree still drives a main-thread SceneTreeTimer. Returns false only when there is no
+		// running main loop at all (tool/headless teardown) -> caller aborts.
 		private async Task<bool> WaitBackoff(float seconds)
 		{
-			var tree = _owner.GetTree();
+			// Guard against a freed owner (scene change / exit) before dereferencing it:
+			// GetTree()/ToSignal() on a disposed object would throw.
+			if (!GodotObject.IsInstanceValid(_owner)) return false;
+			var tree = _owner.GetTree() ?? (Engine.GetMainLoop() as SceneTree);
 			if (tree == null) return false;
 			// processAlways + ignoreTimeScale: the backoff follows real time even when the
 			// game is paused (Paused=true) or time-scaled (Engine.TimeScale=0 for slow-mo),

@@ -47,7 +47,7 @@ namespace Framedash
         // gets captured into saved scenes/autoload state and would deserialize the
         // OLD value over this initializer after an addon upgrade, leaving the
         // X-SDK-Version header stale. Keep in sync with plugin.cfg (release gotcha).
-        public const string SdkVersion = "0.1.2";
+        public const string SdkVersion = "0.1.3";
         private string _playerId = "";
         [Export]
         public string PlayerId
@@ -138,6 +138,14 @@ namespace Framedash
         // background threads in Track(); ensures the initialized state and the fields it
         // guards (_buffer/_session/etc.) are visible across threads without caching.
         private volatile bool _initialized;
+        // True once Shutdown() has run on an explicitly-initialized SDK. Prevents _Ready's
+        // auto-init from REVIVING a shut-down instance. Critical for an auto-created node
+        // (no autoload) whose DEFERRED tree entry races a same-frame Initialize + Shutdown():
+        // without this, when the node finally enters the tree _Ready would see _initialized
+        // == false + a non-empty (Initialize-set) ApiKey and re-initialize, disposing the
+        // transport out from under the parked best-effort final flush (it would then send on a
+        // freed HttpRequest). Cleared on a genuine re-init. Written/read on the main thread only.
+        private bool _shutdownCalled;
         private int _estimatedPayloadBytes;
         // Single-flight flush guard + re-init generation, extracted to FlushGate so the
         // concurrency semantics are unit-tested (engine-free). Only one flush is in
@@ -288,7 +296,11 @@ namespace Framedash
             ProcessMode = ProcessModeEnum.Always;
             // Auto-initialize when an API key was supplied via the inspector/autoload,
             // mirroring Unity's Start(). Code-driven setups call Initialize() instead.
-            if (!_initialized && !string.IsNullOrEmpty(ApiKey))
+            // Skip after an explicit Shutdown() (_shutdownCalled): a same-frame
+            // Initialize+Shutdown on an auto-created node would otherwise re-init here when
+            // the deferred tree entry finally fires, reviving the SDK and disposing the
+            // transport under the parked final flush.
+            if (!_initialized && !_shutdownCalled && !string.IsNullOrEmpty(ApiKey))
             {
                 InitializeInternal();
             }
@@ -422,6 +434,9 @@ namespace Framedash
             // completion from a prior session will not release this session's guard.
             _flushRequested = false;
             _flushGate.Reset();
+            // A genuine (re-)init clears the shutdown latch so a subsequent Shutdown() can set
+            // it again and _Ready's auto-init guard reflects the current lifecycle state.
+            _shutdownCalled = false;
             Interlocked.Exchange(ref _estimatedPayloadBytes, 0);
             // A fresh session owns no automated-session state: the SessionManager (which holds
             // the build_id override + ci.* snapshot) is recreated below, so a prior Begin
@@ -953,9 +968,21 @@ namespace Framedash
             }
         }
 
-        /// <summary>Shutdown the SDK gracefully (final best-effort flush).</summary>
+        /// <summary>Shutdown the SDK gracefully (final best-effort flush). Safe to call from any thread (a background-thread call is marshalled to the main thread).</summary>
         public void Shutdown()
         {
+            // Shutdown mutates lifecycle state (_initialized/_shutdownCalled) and drives the
+            // final Flush(), all of which touch the scene tree / must stay ordered on the main
+            // thread. Marshal the WHOLE method to the main thread (like Flush) when called off
+            // it: otherwise Flush() would defer itself and return, and _initialized=false would
+            // then be set on the background thread BEFORE the deferred flush runs, so the
+            // deferred final flush no-ops and silently drops the buffered events. Marshaling also
+            // keeps _shutdownCalled a genuinely main-thread-only field.
+            if (OS.GetThreadCallerId() != OS.GetMainThreadId())
+            {
+                Callable.From(Shutdown).CallDeferred();
+                return;
+            }
             try
             {
                 if (!_initialized) return;
@@ -965,6 +992,9 @@ namespace Framedash
                 // and out of scope for this MVP).
                 Flush();
                 _initialized = false;
+                // Latch the shutdown so _Ready cannot auto-init and revive this instance if
+                // the (auto-created) node's deferred tree entry lands after this Shutdown.
+                _shutdownCalled = true;
                 GD.Print("[Framedash] SDK shut down.");
             }
             catch (Exception e)
