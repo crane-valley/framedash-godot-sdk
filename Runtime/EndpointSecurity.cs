@@ -1,3 +1,5 @@
+#nullable enable
+
 using System;
 
 namespace Framedash
@@ -22,7 +24,7 @@ namespace Framedash
         /// "http://localhost@evil.example" and leak the API key in cleartext to a
         /// non-loopback host.
         /// </summary>
-        public static bool IsEndpointTransportSecure(string endpointUrl)
+        public static bool IsEndpointTransportSecure(string? endpointUrl)
         {
             if (string.IsNullOrEmpty(endpointUrl)) return false;
             // Reject control characters (incl. embedded NUL): a real URL never

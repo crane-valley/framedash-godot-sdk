@@ -1,3 +1,5 @@
+#nullable enable
+
 namespace Framedash
 {
     /// <summary>
@@ -35,7 +37,7 @@ namespace Framedash
         /// Count the decoded entries in a batch the way the consumer does: one per
         /// event plus one per attributes entry plus one per metrics entry.
         /// </summary>
-        public static int CountDecodedEntries(TelemetryEvent[] events)
+        public static int CountDecodedEntries(TelemetryEvent[]? events)
         {
             if (events == null) return 0;
             // TelemetryEvent is a struct (value type), so every array element is a
@@ -62,7 +64,7 @@ namespace Framedash
         /// the payload-byte path or dropped on a 413, and the server enforces the
         /// per-event attribute/metric caps that splitting cannot fix.
         /// </summary>
-        public static bool ExceedsWireCaps(TelemetryEvent[] events)
+        public static bool ExceedsWireCaps(TelemetryEvent[]? events)
         {
             if (events == null || events.Length <= 1) return false;
             return events.Length > MaxEventsPerBatch

@@ -1,3 +1,5 @@
+#nullable enable
+
 using System.Collections.Generic;
 
 namespace Framedash
@@ -32,7 +34,7 @@ namespace Framedash
         /// Set a per-event-name sampling rate that overrides the global rate for the given event name.
         /// Null/empty event names are ignored. Rate is clamped to [0, 1].
         /// </summary>
-        public void SetEventRate(string eventName, float rate)
+        public void SetEventRate(string? eventName, float rate)
         {
             if (string.IsNullOrEmpty(eventName)) return;
             float clamped = System.Math.Clamp(rate, 0f, 1f);
@@ -43,7 +45,7 @@ namespace Framedash
         /// Remove a per-event-name override so the event falls back to the global rate.
         /// Returns true if an override was present.
         /// </summary>
-        public bool RemoveEventRate(string eventName)
+        public bool RemoveEventRate(string? eventName)
         {
             if (string.IsNullOrEmpty(eventName)) return false;
             lock (_ratesLock) { return _eventRates.Remove(eventName); }
@@ -53,7 +55,7 @@ namespace Framedash
         /// Returns true if this event should be kept. Uses a per-event-name rate if one is set
         /// for <paramref name="eventName"/>, otherwise falls back to the global rate.
         /// </summary>
-        public bool ShouldSample(string eventName)
+        public bool ShouldSample(string? eventName)
         {
             float rate;
             lock (_ratesLock)

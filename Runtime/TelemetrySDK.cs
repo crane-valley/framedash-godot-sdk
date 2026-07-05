@@ -43,7 +43,11 @@ namespace Framedash
         [Export] public string EndpointUrl { get; set; } = "https://ingest.framedash.dev/v1/events";
         [Export] public string ApiKey { get; set; } = "";
         [Export] public string BuildId { get; set; } = "";
-        [Export] public string SdkVersion { get; set; } = "0.1.1";
+        // Code constant, deliberately NOT [Export]ed: an exported version property
+        // gets captured into saved scenes/autoload state and would deserialize the
+        // OLD value over this initializer after an addon upgrade, leaving the
+        // X-SDK-Version header stale. Keep in sync with plugin.cfg (release gotcha).
+        public const string SdkVersion = "0.1.2";
         private string _playerId = "";
         [Export]
         public string PlayerId
@@ -82,6 +86,31 @@ namespace Framedash
         public int EventBufferCapacity { get; set; } = EventBuffer.DefaultCapacity;
         [Export] public float FlushIntervalSeconds { get; set; } = 30f;
         [Export] public int MaxPayloadBytes { get; set; } = 102400; // 100KB
+        // Transport resilience (F49). A wedged endpoint (e.g. an IPv6 blackhole with no
+        // Happy Eyeballs) blocks each attempt for the full HTTP timeout while holding the
+        // single-flight flush guard, so a short per-attempt timeout + small retry budget
+        // bound the worst-case flush wall-time (~33s at the defaults) and keep later
+        // flushes from being starved. Both are re-validated to a positive value at init.
+        [Export] public int HttpTimeoutSeconds { get; set; } = 10;
+        [Export] public int MaxRetries { get; set; } = RetryPolicy.DefaultMaxRetries;
+        // Opt-in positive delivery confirmation (F25): logs "Flushed N events (HTTP 202)"
+        // on each successful batch. Off by default so it never spams a shipping game;
+        // first-time integrators flip it on to confirm delivery client-side.
+        private bool _verboseLogging;
+        [Export]
+        public bool VerboseLogging
+        {
+            get => _verboseLogging;
+            set
+            {
+                _verboseLogging = value;
+                // Propagate a runtime toggle to the live transport so flipping this in
+                // the inspector (or via code) takes effect immediately instead of being
+                // frozen at the value captured when the session was initialized. No-op
+                // before init (applied when the transport is created).
+                if (_transport != null) _transport.VerboseLogging = value;
+            }
+        }
 
         private float _samplingRate = 1f;
         [Export(PropertyHint.Range, "0,1")]
@@ -110,11 +139,11 @@ namespace Framedash
         // guards (_buffer/_session/etc.) are visible across threads without caching.
         private volatile bool _initialized;
         private int _estimatedPayloadBytes;
-        private int _isFlushing; // 0 = idle, 1 = flushing (atomic via Interlocked)
-        // Incremented on each (re)initialization; a FlushAsync only releases _isFlushing if
-        // its captured generation still matches, so a stale flush from a prior session cannot
-        // clear the guard for a new session's in-flight flush.
-        private int _flushGeneration;
+        // Single-flight flush guard + re-init generation, extracted to FlushGate so the
+        // concurrency semantics are unit-tested (engine-free). Only one flush is in
+        // flight at a time (the transport owns a single HttpRequest node); a stale flush
+        // from a prior session cannot clear the guard the new session now owns (#1044).
+        private readonly FlushGate _flushGate = new FlushGate();
         private volatile bool _flushRequested;
         private bool _warnedEmptyPlayerId;
         private string _cachedPlatform;
@@ -389,18 +418,18 @@ namespace Framedash
             // Re-init starts fresh: clear flush state left over from a prior session so a
             // previous in-flight flush (now using a disposed transport) cannot block the new
             // session's flushes -- including session_start -- via the single-flight guard.
+            // Reset() clears the guard AND bumps the generation, so a stale FlushAsync
+            // completion from a prior session will not release this session's guard.
             _flushRequested = false;
-            Interlocked.Exchange(ref _isFlushing, 0);
+            _flushGate.Reset();
             Interlocked.Exchange(ref _estimatedPayloadBytes, 0);
-            // New generation: a stale FlushAsync completion from a prior session will not
-            // release this session's flush guard (see FlushAsync).
-            _flushGeneration++;
             // A fresh session owns no automated-session state: the SessionManager (which holds
             // the build_id override + ci.* snapshot) is recreated below, so a prior Begin
             // without an End cannot keep stamping events under the candidate build.
             // Pass 'this' as the owning Node so the transport can issue HTTP requests
             // through Godot's HTTPRequest node lifecycle.
-            _transport = new TransportLayer(this, EndpointUrl, ApiKey, SdkVersion, maxPayloadBytes);
+            _transport = new TransportLayer(this, EndpointUrl, ApiKey, SdkVersion, maxPayloadBytes,
+                ResolveHttpTimeoutSeconds(), ResolveMaxRetries(), VerboseLogging);
             _session = new SessionManager(PlayerId);
             _perfCollector = new PerformanceCollector();
             // Reset the camera snapshot so a re-init (Shutdown then Initialize) does
@@ -457,6 +486,53 @@ namespace Framedash
                 GD.PushWarning($"[Framedash] Max payload bytes must be > 0. Using default {maxPayloadBytes}.");
             }
             return maxPayloadBytes;
+        }
+
+        // Upper bounds for the transport-resilience exports. A misconfigured Inspector
+        // value must not be able to recreate the very starvation this feature fixes: a
+        // huge timeout or retry budget would let a wedged endpoint hold the single-flight
+        // guard for minutes again (and a large retry count would also overflow the
+        // exponential backoff). 60s x 10 attempts is already well beyond any sane setting.
+        private const int MaxHttpTimeoutSeconds = 60;
+        private const int MaxAllowedRetries = 10;
+
+        // Clamp the configured per-attempt HTTP timeout into (0, MaxHttpTimeoutSeconds].
+        // A non-positive value falls back to the RetryPolicy default (10s); an oversized
+        // value is clamped so a misconfiguration cannot recreate unbounded starvation.
+        private int ResolveHttpTimeoutSeconds()
+        {
+            int seconds = HttpTimeoutSeconds;
+            if (seconds <= 0)
+            {
+                seconds = (int)RetryPolicy.DefaultHttpTimeoutSeconds;
+                GD.PushWarning($"[Framedash] HTTP timeout must be > 0. Using default {seconds}s.");
+            }
+            else if (seconds > MaxHttpTimeoutSeconds)
+            {
+                GD.PushWarning($"[Framedash] HTTP timeout ({seconds}s) exceeds the supported maximum ({MaxHttpTimeoutSeconds}s). Clamping.");
+                seconds = MaxHttpTimeoutSeconds;
+            }
+            return seconds;
+        }
+
+        // Clamp the configured retry budget into (0, MaxAllowedRetries]. A non-positive
+        // value falls back to the RetryPolicy default (3 attempts); an oversized value is
+        // clamped so a misconfiguration cannot recreate unbounded starvation or overflow
+        // the exponential backoff.
+        private int ResolveMaxRetries()
+        {
+            int retries = MaxRetries;
+            if (retries <= 0)
+            {
+                retries = RetryPolicy.DefaultMaxRetries;
+                GD.PushWarning($"[Framedash] Max retries must be > 0. Using default {retries}.");
+            }
+            else if (retries > MaxAllowedRetries)
+            {
+                GD.PushWarning($"[Framedash] Max retries ({retries}) exceeds the supported maximum ({MaxAllowedRetries}). Clamping.");
+                retries = MaxAllowedRetries;
+            }
+            return retries;
         }
 
         private int ResolveMaxBatchSize()
@@ -827,29 +903,30 @@ namespace Framedash
             }
             try
             {
-                if (Interlocked.CompareExchange(ref _isFlushing, 1, 0) != 0) return;
+                if (!_flushGate.TryBegin()) return;
                 if (!_initialized || _buffer.Count == 0)
                 {
                     // Nothing to flush -- clear any pending request so _Process does not
                     // re-invoke Flush() every frame while the buffer stays empty.
                     _flushRequested = false;
-                    Interlocked.Exchange(ref _isFlushing, 0);
+                    _flushGate.Release();
                     return;
                 }
-                // Reset _flushRequested AFTER the _isFlushing guard so a
-                // background-thread request arriving between the two checks
-                // is not silently dropped.
+                // Reset _flushRequested AFTER the guard so a background-thread request
+                // arriving between the two checks is not silently dropped.
                 _flushRequested = false;
                 Interlocked.Exchange(ref _estimatedPayloadBytes, 0);
                 // Godot uses async/await rather than coroutines: launch the send
                 // fire-and-forget. FlushAsync awaits the transport in a try/finally
-                // that always resets _isFlushing so a failed send cannot wedge the
-                // single-flight guard. The discard documents the intentional non-await.
-                _ = FlushAsync(_buffer.DequeueAll(), _flushGeneration);
+                // that always releases the gate so a failed send cannot wedge the
+                // single-flight guard. The bounded transport wall-time keeps that
+                // window small so later flushes are not starved. The discard documents
+                // the intentional non-await.
+                _ = FlushAsync(_buffer.DequeueAll(), _flushGate.Generation);
             }
             catch (Exception e)
             {
-                Interlocked.Exchange(ref _isFlushing, 0);
+                _flushGate.Release();
                 GD.PushError($"[Framedash] Flush() failed: {e.Message}");
             }
         }
@@ -871,8 +948,8 @@ namespace Framedash
             finally
             {
                 // Only release the guard if no re-init happened meanwhile; otherwise the new
-                // generation owns _isFlushing and clearing it here could let two sends run.
-                if (generation == _flushGeneration) Interlocked.Exchange(ref _isFlushing, 0);
+                // generation owns the gate and clearing it here could let two sends run.
+                _flushGate.ReleaseIfGeneration(generation);
             }
         }
 

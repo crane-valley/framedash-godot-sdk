@@ -1,3 +1,5 @@
+#nullable enable
+
 using System;
 
 namespace Framedash
@@ -22,7 +24,7 @@ namespace Framedash
     /// </summary>
     public static class SessionIdGenerator
     {
-        [ThreadStatic] private static Xoshiro256PlusPlus s_rng;
+        [ThreadStatic] private static Xoshiro256PlusPlus? s_rng;
 
         /// <summary>
         /// Generate a fresh UUIDv7 string in canonical 8-4-4-4-12 lower-hex
@@ -34,7 +36,7 @@ namespace Framedash
             ulong unixTsMs = ClampNonNegativeUnixMs(
                 DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
 
-            Xoshiro256PlusPlus rng = s_rng;
+            Xoshiro256PlusPlus? rng = s_rng;
             if (rng == null)
             {
                 rng = NewSeededRng();

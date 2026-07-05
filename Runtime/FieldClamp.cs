@@ -1,3 +1,5 @@
+#nullable enable
+
 using System;
 using System.Collections.Generic;
 
@@ -45,12 +47,16 @@ namespace Framedash
         /// (matching the server's JS string-length semantics). If the boundary would
         /// split a surrogate pair, drop the dangling high surrogate so the result is
         /// always valid UTF-16 rather than a lone surrogate (which would serialize to
-        /// a replacement char on the wire).
+        /// a replacement char on the wire). Always returns non-null (a null value
+        /// maps to ""): a Godot addon's .cs files compile directly into the host
+        /// project, so every Godot-coupled call site (e.g. TelemetrySDK's cached
+        /// non-nullable fields) must get a non-nullable result without each one
+        /// having to null-forgive or null-coalesce this helper's return value.
         /// </summary>
-        public static string Truncate(string value, int maxLength)
+        public static string Truncate(string? value, int maxLength)
         {
             if (maxLength <= 0) return "";
-            if (string.IsNullOrEmpty(value) || value.Length <= maxLength) return value;
+            if (string.IsNullOrEmpty(value) || value.Length <= maxLength) return value ?? "";
             int len = maxLength;
             if (char.IsHighSurrogate(value[len - 1])) len--;
             return value.Substring(0, len);
@@ -107,7 +113,7 @@ namespace Framedash
         /// null list -- callers rely on this "no attributes -> null" semantics. Entries
         /// with a null/empty key are skipped; the count is capped at 50.
         /// </summary>
-        public static List<StringPair> ClampAttributes(Dictionary<string, string> attrs)
+        public static List<StringPair>? ClampAttributes(Dictionary<string, string>? attrs)
         {
             if (attrs == null) return null;
             var list = new List<StringPair>(Math.Min(attrs.Count, MaxAttributes));
@@ -129,7 +135,7 @@ namespace Framedash
         /// semantics. Entries with a null/empty key or a NaN/Infinity value are
         /// skipped; the count is capped at 50.
         /// </summary>
-        public static List<FloatPair> ClampMetrics(Dictionary<string, float> metrics)
+        public static List<FloatPair>? ClampMetrics(Dictionary<string, float>? metrics)
         {
             if (metrics == null) return null;
             var list = new List<FloatPair>(Math.Min(metrics.Count, MaxMetrics));

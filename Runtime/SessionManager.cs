@@ -1,3 +1,5 @@
+#nullable enable
+
 using System.Collections.Generic;
 
 namespace Framedash
@@ -24,7 +26,7 @@ namespace Framedash
         // the previous or cleared ci.* labels (or vice versa), which a torn read across two
         // separate fields would allow. volatile: written on the main thread (Set/Clear), read
         // once by the possibly-background Track() stamping path. null = no session active.
-        private volatile AutomatedSession _automated;
+        private volatile AutomatedSession? _automated;
 
         // Immutable snapshot of an automated session. BuildId is null when the session does
         // not override the build_id (the stamp then uses the configured build_id) and is
@@ -33,9 +35,9 @@ namespace Framedash
         // tags and is already clamped to the ingest attribute caps when non-null.
         private sealed class AutomatedSession
         {
-            public readonly string BuildId;
-            public readonly List<StringPair> Attributes;
-            public AutomatedSession(string buildId, List<StringPair> attributes)
+            public readonly string? BuildId;
+            public readonly List<StringPair>? Attributes;
+            public AutomatedSession(string? buildId, List<StringPair>? attributes)
             {
                 BuildId = buildId;
                 Attributes = attributes;
@@ -47,15 +49,15 @@ namespace Framedash
         public readonly struct SessionStamp
         {
             public readonly string BuildId;
-            public readonly List<StringPair> Attributes;
-            public SessionStamp(string buildId, List<StringPair> attributes)
+            public readonly List<StringPair>? Attributes;
+            public SessionStamp(string buildId, List<StringPair>? attributes)
             {
                 BuildId = buildId;
                 Attributes = attributes;
             }
         }
 
-        private static string NormalizePlayerId(string playerId)
+        private static string NormalizePlayerId(string? playerId)
         {
             if (string.IsNullOrWhiteSpace(playerId)) return "";
             // Reuse FieldClamp.Truncate so player_id shares the surrogate-pair-safe
@@ -63,7 +65,7 @@ namespace Framedash
             return FieldClamp.Truncate(playerId.Trim(), MaxPlayerIdLen);
         }
 
-        public SessionManager(string playerId = null)
+        public SessionManager(string? playerId = null)
         {
             SessionId = SessionIdGenerator.NewSessionIdV7();
             PlayerId = NormalizePlayerId(playerId);
@@ -72,7 +74,7 @@ namespace Framedash
         /// <summary>
         /// Update the player ID at runtime (e.g. after login).
         /// </summary>
-        public void SetPlayerId(string playerId)
+        public void SetPlayerId(string? playerId)
         {
             PlayerId = NormalizePlayerId(playerId);
         }
@@ -84,7 +86,7 @@ namespace Framedash
         /// attribute caps, and a null/empty dictionary sets no tags. With neither a build_id
         /// nor any attributes the session is cleared.
         /// </summary>
-        public void SetAutomatedSession(string buildId, Dictionary<string, string> attributes)
+        public void SetAutomatedSession(string? buildId, Dictionary<string, string>? attributes)
         {
             var clamped = FieldClamp.ClampAttributes(attributes);
             var attrs = (clamped != null && clamped.Count > 0) ? clamped : null;
@@ -95,7 +97,7 @@ namespace Framedash
         /// Replace the session-level attributes with no build_id override. Equivalent to
         /// <c>SetAutomatedSession(null, attributes)</c>; a null or empty dictionary clears them.
         /// </summary>
-        public void SetSessionAttributes(Dictionary<string, string> attributes)
+        public void SetSessionAttributes(Dictionary<string, string>? attributes)
             => SetAutomatedSession(null, attributes);
 
         /// <summary>Clear the automated session (ends the build_id override and ci.* tagging).</summary>
@@ -116,7 +118,7 @@ namespace Framedash
         /// background Track() thread -- a post-End event can never carry the candidate build_id
         /// with cleared tags, nor a new build_id with stale tags.
         /// </summary>
-        public SessionStamp ResolveSessionStamp(string fallbackBuildId, List<StringPair> eventAttributes)
+        public SessionStamp ResolveSessionStamp(string fallbackBuildId, List<StringPair>? eventAttributes)
         {
             var s = _automated; // single volatile read -> consistent (BuildId, Attributes)
             if (s == null) return new SessionStamp(fallbackBuildId, eventAttributes);
@@ -130,7 +132,7 @@ namespace Framedash
         /// allocation) when there are no per-event ones, which keeps the periodic heartbeat
         /// allocation-free. The result is capped at <see cref="FieldClamp.MaxAttributes"/>.
         /// </summary>
-        public List<StringPair> MergeWithSessionAttributes(List<StringPair> eventAttributes)
+        public List<StringPair>? MergeWithSessionAttributes(List<StringPair>? eventAttributes)
         {
             // _automated is read once here; its Attributes reference is then immutable.
             return MergeAttributes(_automated?.Attributes, eventAttributes);
@@ -140,7 +142,7 @@ namespace Framedash
         // exceeds the cap), per-event entries overriding a session entry on a key collision,
         // capped at FieldClamp.MaxAttributes. sessionAttrs is the caller's already-snapshotted
         // reference, so this never re-reads the volatile field.
-        private static List<StringPair> MergeAttributes(List<StringPair> sessionAttrs, List<StringPair> eventAttributes)
+        private static List<StringPair>? MergeAttributes(List<StringPair>? sessionAttrs, List<StringPair>? eventAttributes)
         {
             if (sessionAttrs == null) return eventAttributes;
             if (eventAttributes == null || eventAttributes.Count == 0) return sessionAttrs;
