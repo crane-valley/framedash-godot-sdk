@@ -6,6 +6,25 @@ follows [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-07-12
+
+- Map/level load-time capture: `BeginMapLoad(mapName)` / `EndMapLoad()` time a
+  load on a monotonic, time-scale- and pause-safe clock, and
+  `ReportMapLoad(mapName, loadTimeMs)` lets self-measured loaders report a
+  load time directly. Both paths emit a `map_load` auto event carrying
+  `metrics["load_time_ms"]` and `attributes["map_name"]`; `map_id` is
+  deliberately left empty so the event stays out of the spatial heatmap grid
+  and the activation gate. `ReportMapLoad` drops (does not clamp) a NaN,
+  Infinity, or negative `loadTimeMs`. Calling `BeginMapLoad` again before
+  `EndMapLoad` replaces the pending measurement. Safe to call from any
+  thread; fail-safe (never throws, no-op if the SDK is not initialized).
+- `io.*` disk metrics: `ReportIoSample(bytes, readTimeMs, ops)` lets a game
+  feed its own disk-read samples, which the SDK attaches as `io.read_bytes` /
+  `io.read_time_ms` / `io.read_ops` (deltas since the previous heartbeat) to
+  `perf_heartbeat` metrics. Godot exposes no built-in disk-IO counters, so
+  this manual feed is the only source; the attach only happens once a sample
+  has actually landed (no zero-stuffing when the feed is unused).
+
 ## [0.1.3] - 2026-07-05
 
 - Fix a first-flush race when the SDK node is auto-created: a synchronous

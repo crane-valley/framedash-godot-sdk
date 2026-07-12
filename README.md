@@ -38,6 +38,7 @@ Enabling the plugin registers a **Framedash** autoload singleton automatically, 
 | `PerformanceCollector.cs` | Automatic FPS, frame time, memory, GPU/render/process time collection |
 | `SamplingPolicy.cs` | Configurable event sampling and throttling |
 | `EventBuffer.cs` | Batched event buffering before transmission, default 10,000 events |
+| `IoStats.cs` | Thread-safe accumulator for manually-reported disk I/O samples (`ReportIoSample`) |
 
 ## Automatic Events
 
@@ -60,6 +61,65 @@ Both events include full performance metrics from `PerformanceCollector`.
 - **Game-thread (process) time** — `Performance.TimeProcess` for the time spent in the game's `_process` step.
 
 Any metric that the platform or build cannot report is left as `0`, which the wire contract treats as "not collected" (it is not a measured zero).
+
+## Disk I/O Metrics (Manual Feed)
+
+Godot exposes no engine-level disk I/O counters, so unlike the Unity/UE5 SDKs
+this SDK collects `io.*` metrics **only** if your game reports them. Call
+`ReportIoSample` from your own loader/VFS code as reads complete; the SDK
+accumulates a window and attaches it to the next `perf_heartbeat` as
+`metrics["io.read_bytes"]`, `metrics["io.read_time_ms"]`, and
+`metrics["io.read_ops"]` (window deltas since the previous heartbeat, then
+reset). If `ReportIoSample` is never called, these keys are simply absent from
+`perf_heartbeat` -- absent means "not collected", not a measured zero. Safe to
+call from any thread; never throws.
+
+```csharp
+using Godot;
+
+// Poll a threaded resource load and report the elapsed time as one I/O sample
+// once it finishes. Adapt bytes/ops to whatever your loader actually knows.
+ResourceLoader.LoadThreadedRequest(path);
+ulong startUsec = Time.GetTicksUsec();
+
+// ... on a later frame, once ResourceLoader.LoadThreadedGetStatus(path)
+// reports ThreadLoadStatus.Loaded ...
+float elapsedMs = (Time.GetTicksUsec() - startUsec) / 1000f;
+Framedash.TelemetrySDK.Instance.ReportIoSample(
+    bytes: estimatedFileSizeBytes,
+    readTimeMs: elapsedMs,
+    ops: 1);
+```
+
+## Map/Level Load-Time
+
+Measure how long a scene/level takes to load and emit it as a `map_load` event.
+The load time rides the generic metrics map (`load_time_ms`) and the loaded map
+name rides the attributes map as `attributes["map_name"]`. `map_id` is left **empty**
+on purpose (like `perf_heartbeat`): a `map_load` has no world position, so an empty
+`map_id` keeps it out of the spatial heatmap and the activation gate, which key on a
+non-empty `map_id`. There is no dedicated proto or ClickHouse column yet (web/CLI
+charts, grouped by `attributes['map_name']`, and `perf-diff` gating land in a
+follow-up PR). Query it today via the data-export / query REST API (e.g.
+`metrics['load_time_ms']`). The event flows through the normal `Track` path, so it is
+sampled and buffered like any other event.
+
+```csharp
+// Time a load with the built-in timer:
+Framedash.TelemetrySDK.Instance.BeginMapLoad("world_1");
+// ... load the scene ...
+Framedash.TelemetrySDK.Instance.EndMapLoad();   // emits map_load (map_name="world_1", load_time_ms=elapsed)
+
+// Or report a time you measured yourself (custom/streaming loaders):
+Framedash.TelemetrySDK.Instance.ReportMapLoad("world_1", loadTimeMs: 842.0);
+```
+
+The timer uses a monotonic wall clock, so a paused tree or changed
+`Engine.TimeScale` does not distort the measurement. Calling `BeginMapLoad` again
+before `EndMapLoad` replaces the pending measurement; `EndMapLoad` with no pending
+`BeginMapLoad` is a no-op. A NaN/Infinity/negative `ReportMapLoad` time is dropped
+(not clamped). All three methods are safe to call from any thread, never throw, and
+are no-ops before `Initialize()`.
 
 ## Camera Direction
 
