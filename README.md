@@ -62,6 +62,37 @@ Both events include full performance metrics from `PerformanceCollector`.
 
 Any metric that the platform or build cannot report is left as `0`, which the wire contract treats as "not collected" (it is not a measured zero).
 
+## GPU Memory Metrics (Automatic)
+
+In addition to `Performance.MemoryStatic` (the `memory_used_bytes` field above),
+the SDK also samples three GPU-memory monitors and attaches them to the metrics
+map as bytes:
+
+- `metrics["mem.vram"]` — `Performance.Monitor.RenderVideoMemUsed`
+- `metrics["mem.textures"]` — `Performance.Monitor.RenderTextureMemUsed`
+- `metrics["mem.buffers"]` — `Performance.Monitor.RenderBufferMemUsed`
+
+These attach to **every `perf_heartbeat`**, AND to **any other event tracked
+with a non-empty `mapId`** (a "position-qualified" event). The heartbeat alone
+has an empty `map_id` and no position, so the spatial heatmap grid query (which
+keys on `map_id` + cell bounds) would never see `mem.*` data from it alone;
+attaching to position-qualified events too makes `mem.*` queryable per heatmap
+cell. An event tracked with an empty `mapId` (other than `perf_heartbeat`, e.g.
+`map_load`) gets no `mem.*` keys. If your own `Track()` call already supplies a
+metric under one of these exact keys, your value is kept — the SDK never
+overwrites a caller-supplied metric.
+
+No opt-in flag is needed (these monitors are cheap to read). Each key follows
+the same "absent means not collected" rule as the other performance fields: a
+monitor reading of `0` or less (headless build, unsupported backend, or a
+sampling failure) omits that key entirely from the event rather than
+sending a `0` metric. Unlike the `memory_used_bytes` Tier-1 field, these values
+have no fixed byte ceiling -- a large workstation GPU's true VRAM reading is
+sent as-is. If a `Track()` call's own metrics are already at the 50-metric
+ingest cap, no `mem.*` key is appended (your metrics always fit first); if
+partial room remains, `mem.vram` is appended before `mem.textures` before
+`mem.buffers`.
+
 ## Disk I/O Metrics (Manual Feed)
 
 Godot exposes no engine-level disk I/O counters, so unlike the Unity/UE5 SDKs

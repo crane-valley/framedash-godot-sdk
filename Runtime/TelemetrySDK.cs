@@ -47,7 +47,7 @@ namespace Framedash
         // gets captured into saved scenes/autoload state and would deserialize the
         // OLD value over this initializer after an addon upgrade, leaving the
         // X-SDK-Version header stale. Keep in sync with plugin.cfg (release gotcha).
-        public const string SdkVersion = "0.1.4";
+        public const string SdkVersion = "0.1.5";
         private string _playerId = "";
         [Export]
         public string PlayerId
@@ -152,10 +152,35 @@ namespace Framedash
         // flight at a time (the transport owns a single HttpRequest node); a stale flush
         // from a prior session cannot clear the guard the new session now owns (#1044).
         private readonly FlushGate _flushGate = new FlushGate();
+        // Wall-clock cap for the synchronous shutdown drain (DrainBlocking). Small on
+        // purpose: a terminal-quit blocking POST must never make the app hang closing, so
+        // a wedged endpoint is abandoned after this budget and the events are lost
+        // (best-effort, no offline queue). Comfortably covers a healthy resolve + TLS +
+        // POST round trip; the async runtime path keeps its own larger retry budget.
+        private const int ShutdownDrainBudgetMs = 2500;
+        // Retains the batch handed to the current in-flight async FlushAsync. A normal
+        // flush dequeues its events into a fire-and-forget task; if quit races that send
+        // (buffer already empty, task not yet resumed), synchronous teardown would lose
+        // it. Keeping the reference lets the shutdown drain resend it via the blocking
+        // path. Cleared when that flush resolves. Main-thread only: Flush() marshals to
+        // the main thread and the FlushAsync continuation resumes there too.
+        private TelemetryEvent[] _inFlightBatch;
         private volatile bool _flushRequested;
         private bool _warnedEmptyPlayerId;
         private string _cachedPlatform;
         private string _cachedEngineVersion;
+        // mem.* metrics list (mem.vram / mem.textures / mem.buffers), rebuilt ONLY at
+        // heartbeat cadence (see TrackInternal) and shared by reference with every
+        // position-qualified event tracked before the next heartbeat -- rebuilding per
+        // event would allocate a new List<FloatPair> on the spatial telemetry hot path,
+        // violating the allocation-discipline hard rule. volatile so a Track() call on a
+        // background thread observes the latest reference published from the main
+        // thread's heartbeat without a lock. Null until the first heartbeat runs, and
+        // whenever the current sample has nothing to report (all monitors <= 0).
+        // Refresh REPLACES this field with a brand-new list; it is never mutated in
+        // place, because a TelemetryEvent already holding the old reference can still be
+        // sitting unflushed in the EventBuffer ring buffer (see MemMetricsBuilder.AttachTo).
+        private volatile List<FloatPair> _cachedMemMetrics;
         // The automated-session (CI) build_id override and ci.* attributes live together in
         // the SessionManager as one immutable snapshot (see SessionManager.ResolveSessionStamp),
         // so the public [Export] BuildId property is never overwritten and the stamping path
@@ -713,6 +738,9 @@ namespace Framedash
                             new FloatPair("io.read_ops", window.ReadOps),
                         };
                     }
+                    // mem.* attach is handled centrally in TrackInternal (it always fires
+                    // for perf_heartbeat, and also for any position-qualified event), so
+                    // it is not duplicated here.
                 }
 
                 TrackInternal(
@@ -861,6 +889,30 @@ namespace Framedash
             List<FloatPair> metrics)
         {
             var perf = _perfCollector.Collect();
+
+            // mem.* GPU-memory metrics (mem.vram / mem.textures / mem.buffers) attach to
+            // perf_heartbeat (as before) AND to any position-qualified event (non-empty
+            // map_id) -- the spatial heatmap grid query keys on map_id + cell bounds, so a
+            // heartbeat-only attach (empty map_id, no position) is invisible to it.
+            //
+            // perf_heartbeat is the ONLY refresh point: it rebuilds the mem.* list fresh
+            // from the current PerfSnapshot and REPLACES _cachedMemMetrics (never mutates
+            // the previous instance -- see MemMetricsBuilder.AttachTo for why). Every other
+            // position-qualified event reuses that same cached reference instead of
+            // resampling/reallocating per event, which would violate the allocation-
+            // discipline hard rule on the spatial telemetry hot path. This means a
+            // position-qualified event's mem.* values can be up to one heartbeat interval
+            // (HeartbeatIntervalSeconds) stale -- acceptable, matching the Unity/UE5
+            // cached-sample semantics for per-frame performance fields. Before the first
+            // heartbeat has ever run, _cachedMemMetrics is null and mem.* is simply absent.
+            if (eventName == PerfHeartbeatEventName)
+            {
+                _cachedMemMetrics = MemMetricsBuilder.Build(perf.VramBytes, perf.TexturesBytes, perf.BuffersBytes);
+            }
+            if (eventName == PerfHeartbeatEventName || !string.IsNullOrEmpty(mapId))
+            {
+                metrics = MemMetricsBuilder.AttachTo(metrics, _cachedMemMetrics);
+            }
 
             // Read the camera snapshot atomically; TryUnpackCamera yields a coherent
             // pair or nothing (both-or-neither). The serializer is the final guard.
@@ -1100,8 +1152,11 @@ namespace Framedash
                 // that always releases the gate so a failed send cannot wedge the
                 // single-flight guard. The bounded transport wall-time keeps that
                 // window small so later flushes are not starved. The discard documents
-                // the intentional non-await.
-                _ = FlushAsync(_buffer.DequeueAll(), _flushGate.Generation);
+                // the intentional non-await. Retain the batch so a shutdown that races
+                // this unconfirmed send can resend it via the blocking drain.
+                var batch = _buffer.DequeueAll();
+                _inFlightBatch = batch;
+                _ = FlushAsync(batch, _flushGate.Generation);
             }
             catch (Exception e)
             {
@@ -1126,10 +1181,55 @@ namespace Framedash
             }
             finally
             {
+                // Drop the in-flight retention once this flush has resolved (success or
+                // failure): a later shutdown has nothing unconfirmed to resend. Reference-
+                // compare so a newer flush's batch is never cleared here.
+                if (ReferenceEquals(_inFlightBatch, events)) _inFlightBatch = null;
                 // Only release the guard if no re-init happened meanwhile; otherwise the new
                 // generation owns the gate and clearing it here could let two sends run.
                 _flushGate.ReleaseIfGeneration(generation);
             }
+        }
+
+        // Deliver the buffered events SYNCHRONOUSLY on a terminal-quit path. The async
+        // Flush() cannot complete once the app is quitting -- the main loop stops before
+        // the awaited SendBatch continuation runs, and the owner node leaves the tree --
+        // so a fire-and-forget send would only dequeue the buffer into a doomed task and
+        // lose the final events (typically the last perf_heartbeat). The transport's
+        // blocking HttpClient path needs no scene-tree node and is bounded so quit is
+        // never hung. Main-thread only: every caller is an engine teardown callback or the
+        // already-marshaled Shutdown.
+        private void DrainBlocking()
+        {
+            // Called from Shutdown AFTER _initialized was flipped false (so no new events
+            // are accepted); do not re-check _initialized here or the drain would no-op.
+            if (_transport == null) return;
+
+            // Recover a batch an async flush already dequeued but has not confirmed: its
+            // awaited send cannot resume during synchronous teardown, so those events
+            // (already gone from the buffer) would otherwise be lost.
+            var inFlight = _inFlightBatch;
+            _inFlightBatch = null;
+
+            TelemetryEvent[] buffered = _buffer != null && _buffer.Count > 0
+                ? _buffer.DequeueAll()
+                : System.Array.Empty<TelemetryEvent>();
+
+            // Send the buffered events and the in-flight batch as SEPARATE envelopes, never
+            // concatenated: the consumer dedups by hashing the full ordered event array, so
+            // re-sending the in-flight batch with its ORIGINAL array is dropped if it
+            // already reached ingest, whereas merging it with the buffered events would
+            // hash differently and duplicate every in-flight event (see
+            // BatchPolicy.BuildShutdownEnvelopes). Buffered goes first (guaranteed-
+            // undelivered final events). Both share one drain budget.
+            TelemetryEvent[][] envelopes = BatchPolicy.BuildShutdownEnvelopes(buffered, inFlight);
+            if (envelopes.Length == 0) return;
+
+            // Clear the running payload estimate so a later no-op flush cannot act on a
+            // stale byte count.
+            Interlocked.Exchange(ref _estimatedPayloadBytes, 0);
+
+            _transport.SendEnvelopesBlocking(envelopes, ShutdownDrainBudgetMs);
         }
 
         /// <summary>Shutdown the SDK gracefully (final best-effort flush). Safe to call from any thread (a background-thread call is marshalled to the main thread).</summary>
@@ -1150,15 +1250,24 @@ namespace Framedash
             try
             {
                 if (!_initialized) return;
-                // Best-effort final flush. An in-flight async send may not finish
-                // before the process exits — this is the same limitation as the Unity
-                // SDK, which has no offline/persistent queue (that is a UE5-only feature
-                // and out of scope for this MVP).
-                Flush();
+                // Stop accepting new events BEFORE taking the final snapshot. _initialized
+                // is volatile and Track() bails on it, so a producer (possibly on a
+                // background thread) cannot enqueue an event after this point that the
+                // drain's DequeueAll would then miss and silently drop. (A Track already
+                // past its _initialized check when the flag flips is an inherent last-
+                // instant lock-free race and is unchanged by this ordering.) Latch the
+                // shutdown too so a deferred tree entry cannot auto-init and revive the
+                // instance mid-drain.
                 _initialized = false;
-                // Latch the shutdown so _Ready cannot auto-init and revive this instance if
-                // the (auto-created) node's deferred tree entry lands after this Shutdown.
                 _shutdownCalled = true;
+                // Final flush must be SYNCHRONOUS: _ExitTree tears the tree down in the
+                // same call, so an async Flush() would resume after the node (and its
+                // HttpRequest child) left the tree and drop the buffered events (the final
+                // perf_heartbeat). Drain via the transport's blocking HttpClient path
+                // instead, bounded so quit is never hung. Godot still has no offline queue
+                // (that is UE5-only), so a send that fails within the budget is lost --
+                // best-effort by design.
+                DrainBlocking();
                 GD.Print("[Framedash] SDK shut down.");
             }
             catch (Exception e)
@@ -1190,10 +1299,14 @@ namespace Framedash
                         Flush();
                         break;
 
-                    // The window/OS requested a close — flush before teardown.
-                    // Unity: OnApplicationQuit precursor.
+                    // The window/OS requested a close. This is NOT necessarily terminal:
+                    // a game may set SceneTree.AutoAcceptQuit=false to show a confirm
+                    // dialog or reject the close, so draining here would block the main
+                    // thread and permanently drop events even though the app keeps running.
+                    // The terminal drain runs from _ExitTree/Predelete (Shutdown) once the
+                    // quit is actually accepted, so nothing is needed here. Unity:
+                    // OnApplicationQuit precursor.
                     case (int)NotificationWMCloseRequest:
-                        Flush();
                         break;
 
                     // Node is about to be deleted — final best-effort flush. Pairs with

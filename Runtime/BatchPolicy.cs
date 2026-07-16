@@ -70,5 +70,101 @@ namespace Framedash
             return events.Length > MaxEventsPerBatch
                 || CountDecodedEntries(events) > MaxDecodedEntries;
         }
+
+        // Rough per-event fixed-field byte estimate (event name, ids, position,
+        // platform, engine version, timestamp, protobuf framing) for the blocking-drain
+        // pre-serialization size split. Deliberately generous so the estimate is not an
+        // undercount that lets an oversized chunk through.
+        private const int EventBaseByteEstimate = 256;
+        // Protobuf key/length framing added per map entry on top of the key+value chars.
+        private const int MapEntryOverheadBytes = 8;
+        // Per-metric entry beyond its key chars: the float value plus framing.
+        private const int MetricEntryByteEstimate = 16;
+
+        /// <summary>
+        /// Max estimated UNCOMPRESSED bytes a single blocking-drain serialize+gzip may
+        /// process before the batch is split. serialize+gzip is uninterruptible, so this
+        /// bounds one CPU unit: ~1 MiB serializes and gzips in a few milliseconds even on
+        /// weak hardware, keeping the synchronous shutdown drain within its time budget.
+        /// </summary>
+        public const long MaxBlockingChunkBytes = 1 << 20;
+
+        /// <summary>
+        /// Conservative estimate of a batch's uncompressed serialized size in bytes, used
+        /// ONLY to bound the work of one serialize+gzip on the synchronous shutdown drain.
+        /// An attribute-heavy legal batch (up to <see cref="MaxDecodedEntries"/> map
+        /// entries whose values can each be hundreds of chars) can otherwise be tens of
+        /// MB, and a single uninterruptible serialize could overrun the drain budget.
+        /// String lengths are UTF-16 char counts, which track serialize/gzip CPU cost
+        /// closely enough for a chunking threshold.
+        /// </summary>
+        public static long EstimateSerializedBytes(TelemetryEvent[]? events)
+        {
+            if (events == null) return 0;
+            long total = 0;
+            for (int i = 0; i < events.Length; i++)
+            {
+                total += EventBaseByteEstimate;
+                var attributes = events[i].Attributes;
+                var metrics = events[i].Metrics;
+                if (attributes != null)
+                {
+                    for (int a = 0; a < attributes.Count; a++)
+                    {
+                        string key = attributes[a].Key;
+                        string value = attributes[a].Value;
+                        total += (key != null ? key.Length : 0)
+                            + (value != null ? value.Length : 0)
+                            + MapEntryOverheadBytes;
+                    }
+                }
+                if (metrics != null)
+                {
+                    for (int m = 0; m < metrics.Count; m++)
+                    {
+                        string key = metrics[m].Key;
+                        total += (key != null ? key.Length : 0) + MetricEntryByteEstimate;
+                    }
+                }
+            }
+            return total;
+        }
+
+        /// <summary>
+        /// Whether a batch must be split BEFORE serialization on the blocking shutdown
+        /// drain to keep each serialize+gzip bounded (see <see cref="MaxBlockingChunkBytes"/>).
+        /// A single event is never split here: it cannot exceed the per-event server caps
+        /// by enough to matter, and there is nothing smaller to send.
+        /// </summary>
+        public static bool ExceedsBlockingChunkBytes(TelemetryEvent[]? events)
+        {
+            if (events == null || events.Length <= 1) return false;
+            return EstimateSerializedBytes(events) > MaxBlockingChunkBytes;
+        }
+
+        /// <summary>
+        /// Ordered list of INDEPENDENT envelopes to POST on the synchronous shutdown
+        /// drain. The freshly-buffered events and a retained-but-unconfirmed in-flight
+        /// batch are kept as SEPARATE envelopes, never concatenated: the consumer
+        /// deduplicates by hashing the full ordered event array
+        /// (apps/consumer/src/message-helpers.ts hashEventBatch), so re-sending the
+        /// in-flight batch with its ORIGINAL array keeps the same dedup token and is
+        /// dropped if it already reached ingest, whereas an "in-flight + buffered"
+        /// concatenation would hash differently and duplicate every in-flight event (both
+        /// charged and inserted). <paramref name="buffered"/> is ordered FIRST because it
+        /// is guaranteed-undelivered (the final perf_heartbeat, the primary loss this
+        /// drain fixes), so a wedged endpoint under the shared deadline cannot starve it
+        /// behind a possibly-redundant in-flight resend. Empty/null batches are omitted.
+        /// </summary>
+        public static TelemetryEvent[][] BuildShutdownEnvelopes(
+            TelemetryEvent[]? buffered, TelemetryEvent[]? inFlight)
+        {
+            bool haveBuffered = buffered != null && buffered.Length > 0;
+            bool haveInFlight = inFlight != null && inFlight.Length > 0;
+            if (haveBuffered && haveInFlight) return new[] { buffered!, inFlight! };
+            if (haveBuffered) return new[] { buffered! };
+            if (haveInFlight) return new[] { inFlight! };
+            return System.Array.Empty<TelemetryEvent[]>();
+        }
     }
 }

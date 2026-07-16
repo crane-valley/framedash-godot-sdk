@@ -6,6 +6,42 @@ follows [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-07-17
+
+- Memory-category metrics: the SDK attaches `mem.vram`, `mem.textures`, and
+  `mem.buffers` (sourced from Godot `Performance` monitors) to
+  `perf_heartbeat` metrics and to position-qualified events (non-empty
+  `map_id`; a cached sample refreshed at heartbeat cadence -- the event path
+  does no engine reads). A reading of zero or below is omitted: absent means
+  not collected, never a fabricated 0. Caller-supplied metric keys always
+  win, both on key collision and on capacity -- `mem.*` fills only the
+  remaining slots below the 50-metric ingest cap, with `mem.vram` taking
+  priority when capacity is partial.
+- Deliver the final buffered events on a clean shutdown. `_ExitTree` tears the
+  scene tree down synchronously, so the async `Flush()` used at teardown could
+  never complete -- its awaited send resumed after the owner node (and its
+  `HttpRequest` child) had already left the tree, so the last batch (typically the
+  final `perf_heartbeat`) was dropped. `Shutdown()` (run from `_ExitTree` /
+  predelete) now drains the buffer synchronously through a blocking `HttpClient`
+  POST that needs no scene-tree node, bounded by a short (2.5s) budget so
+  application quit is never hung. A batch an async flush had already dequeued but
+  not confirmed is retained and resent as its OWN separate envelope (never merged
+  with the buffered events) so the server's batch-hash dedup drops it if it already
+  reached ingest, so an in-flight flush racing quit is recovered without
+  duplicating already-delivered events. The window-close notification no longer flushes -- it can be canceled
+  (`AutoAcceptQuit=false`), so the drain is deferred to the accepted-quit teardown
+  instead of blocking/dropping on a cancelable event. The normal per-frame/interval
+  flush path is unchanged, and the non-terminal background-pause notification keeps
+  using the async flush. Godot still has no offline queue, so a send that fails
+  within the budget is lost (best-effort by design).
+- Stop printing a spurious native `Parameter data.tree is null` error during the
+  documented `_Ready()` quickstart. On the auto-create path (no plugin autoload),
+  the first flush runs while the node is briefly outside the tree, where the retry
+  backoff called `Node.GetTree()`; the engine pushes that error to the console
+  before returning null. The call is now guarded by `IsInsideTree()` and falls
+  back to the main-loop `SceneTree` directly. Functionally unchanged (the fallback
+  already recovered); only the misleading error print is gone.
+
 ## [0.1.4] - 2026-07-12
 
 - Map/level load-time capture: `BeginMapLoad(mapName)` / `EndMapLoad()` time a

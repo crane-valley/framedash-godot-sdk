@@ -532,7 +532,16 @@ namespace Framedash
 			// Guard against a freed owner (scene change / exit) before dereferencing it:
 			// GetTree()/ToSignal() on a disposed object would throw.
 			if (!GodotObject.IsInstanceValid(_owner)) return false;
-			var tree = _owner.GetTree() ?? (Engine.GetMainLoop() as SceneTree);
+			// Only call GetTree() when the node is actually in the tree. Node::get_tree()
+			// pushes a native "Parameter data.tree is null" error to the console when the
+			// node is OUTSIDE the tree before returning null -- which is exactly the
+			// auto-create first-flush case (deferred AddChild, owner not yet in tree). The
+			// null-coalescing fallback recovered functionally, but the spurious error was
+			// still printed during the documented quickstart. Skip GetTree() off-tree and
+			// go straight to the main-loop SceneTree, which drives the same main-thread
+			// SceneTreeTimer.
+			var tree = (_owner.IsInsideTree() ? _owner.GetTree() : null)
+				?? (Engine.GetMainLoop() as SceneTree);
 			if (tree == null) return false;
 			// processAlways + ignoreTimeScale: the backoff follows real time even when the
 			// game is paused (Paused=true) or time-scaled (Engine.TimeScale=0 for slow-mo),
@@ -574,6 +583,203 @@ namespace Framedash
 			{
 				return string.Empty;
 			}
+		}
+
+		// ---- Synchronous shutdown drain --------------------------------------------
+		//
+		// The normal flush path (SendBatch) is async and dispatches through the
+		// HttpRequest scene-tree node. During synchronous tree teardown (_ExitTree on
+		// quit) that path can never complete: the awaited continuation resumes only on a
+		// later main-loop frame, but the owner node -- and its HttpRequest child -- have
+		// already left the tree, so the batch is dropped (RequestRaw returns
+		// ERR_UNCONFIGURED / the owner is no longer in the tree). Godot's low-level
+		// HttpClient needs no scene-tree node, so it can POST from a blocking call inside
+		// the teardown. The whole drain is bounded by a small wall-clock budget so a
+		// wedged endpoint can never hang application quit. The async runtime path above
+		// is intentionally left unchanged.
+
+		// Poll cadence for the blocking HttpClient state machine. 10ms keeps quit
+		// responsive while not busy-spinning the CPU during the (bounded) drain.
+		private const int BlockingPollMs = 10;
+
+		/// <summary>
+		/// Best-effort SYNCHRONOUS drain used only on shutdown/teardown, when the async
+		/// HttpRequest path cannot complete. Each envelope is POSTed as its OWN independent
+		/// blocking request (never concatenated): the consumer deduplicates by hashing the
+		/// full ordered event array (apps/consumer message-helpers.hashEventBatch), so an
+		/// envelope re-sent with its original event array keeps the same dedup token and is
+		/// dropped if it already reached ingest -- merging it with other events would change
+		/// the hash and duplicate those events. All envelopes SHARE one wall-clock budget
+		/// (<paramref name="budgetMs"/>) so quit is never hung; on timeout later envelopes
+		/// are dropped gracefully. A failed envelope does NOT skip the rest. Each envelope
+		/// is still split internally (wire caps, then estimated size, then payload bytes)
+		/// so no single serialize+gzip or request is unbounded. Returns true only when every
+		/// envelope was accepted (HTTP 2xx). Never throws (fail-safe).
+		/// </summary>
+		public bool SendEnvelopesBlocking(TelemetryEvent[][] envelopes, int budgetMs)
+		{
+			// An empty or disabled drain is a no-op success: there is nothing to lose.
+			if (_disabled || envelopes == null || envelopes.Length == 0) return true;
+			var elapsed = Stopwatch.StartNew();
+			try
+			{
+				bool ok = true;
+				for (int i = 0; i < envelopes.Length; i++)
+				{
+					TelemetryEvent[] batch = envelopes[i];
+					if (batch == null || batch.Length == 0) continue;
+					// Do NOT short-circuit on failure: a failed (possibly-redundant) in-flight
+					// resend must not skip a later, guaranteed-undelivered envelope.
+					ok = SendChunkBlocking(batch, elapsed, budgetMs) && ok;
+				}
+				return ok;
+			}
+			catch (Exception e)
+			{
+				GD.PushError($"[Framedash] Shutdown drain failed: {e.Message}");
+				return false;
+			}
+		}
+
+		private bool SendChunkBlocking(TelemetryEvent[] events, Stopwatch elapsed, int budgetMs)
+		{
+			if (events.Length == 0) return true;
+			if (elapsed.ElapsedMilliseconds >= budgetMs)
+			{
+				GD.PushError($"[Framedash] Shutdown drain budget exhausted; dropping {events.Length} events.");
+				return false;
+			}
+
+			// Same server per-request caps as the async path: an over-cap batch is
+			// rejected wholesale, so split before serializing.
+			if (BatchPolicy.ExceedsWireCaps(events))
+				return SplitAndSendBlocking(events, elapsed, budgetMs);
+
+			// Bound the CPU of the (uninterruptible) serialize+gzip: an attribute-heavy
+			// legal backlog can be tens of MB and would blow the drain budget in one shot
+			// before any budget re-check. Split by estimated size FIRST so each serialize
+			// stays within MaxBlockingChunkBytes.
+			if (BatchPolicy.ExceedsBlockingChunkBytes(events))
+				return SplitAndSendBlocking(events, elapsed, budgetMs);
+
+			byte[] payload;
+			try
+			{
+				payload = Compress(TelemetrySerializer.Serialize(events));
+			}
+			catch (Exception e)
+			{
+				GD.PushError($"[Framedash] Serialization failed during shutdown drain: {e.Message}");
+				return false;
+			}
+
+			// Re-check the budget AFTER serialize+gzip: those run inside the shared window
+			// but are not themselves interruptible, so a large backlog could have consumed
+			// the budget here. Bailing now keeps the total bounded (no network time is
+			// added on top of an already-overrun serialize).
+			if (elapsed.ElapsedMilliseconds >= budgetMs)
+			{
+				GD.PushError($"[Framedash] Shutdown drain budget exhausted; dropping {events.Length} events.");
+				return false;
+			}
+
+			if (payload.Length > _maxPayloadBytes && events.Length > 1)
+				return SplitAndSendBlocking(events, elapsed, budgetMs);
+
+			return PostBlocking(payload, events.Length, elapsed, budgetMs);
+		}
+
+		// Both halves share the SAME elapsed stopwatch / budget so the whole drain stays
+		// within one bound regardless of split depth (mirrors SplitAndResend).
+		private bool SplitAndSendBlocking(TelemetryEvent[] events, Stopwatch elapsed, int budgetMs)
+		{
+			int mid = events.Length / 2;
+			var first = new TelemetryEvent[mid];
+			var second = new TelemetryEvent[events.Length - mid];
+			Array.Copy(events, 0, first, 0, mid);
+			Array.Copy(events, mid, second, 0, events.Length - mid);
+			bool okFirst = SendChunkBlocking(first, elapsed, budgetMs);
+			bool okSecond = SendChunkBlocking(second, elapsed, budgetMs);
+			return okFirst && okSecond;
+		}
+
+		// One blocking POST via HttpClient. Drives the connect -> request -> response
+		// state machine by hand (Poll + a short sleep), re-checking the shared budget at
+		// every step so a stalled connect / handshake / response cannot overrun the quit
+		// budget. Connects by hostname and lets HttpClient resolve: the IPv4-preference
+		// plan of the async path is a per-flush latency optimization not worth
+		// duplicating on the one-shot teardown drain, and the budget already caps a slow
+		// resolve. Returns true only on a 2xx response.
+		private bool PostBlocking(byte[] payload, int eventCount, Stopwatch elapsed, int budgetMs)
+		{
+			if (!BlockingRequestTarget.TryParse(_endpointUrl, out var target))
+			{
+				GD.PushError($"[Framedash] Shutdown drain could not parse endpoint; dropping {eventCount} events.");
+				return false;
+			}
+
+			var client = new HttpClient();
+			try
+			{
+				TlsOptions? tls = target.UseTls ? TlsOptions.Client() : null;
+				if (client.ConnectToHost(target.Host, target.Port, tls) != Error.Ok) return false;
+
+				// Wait for the connection (Resolving -> Connecting -> Connected). Any
+				// other status is a terminal connect/handshake failure.
+				while (true)
+				{
+					HttpClient.Status status = client.GetStatus();
+					if (status == HttpClient.Status.Connected) break;
+					if (status != HttpClient.Status.Resolving && status != HttpClient.Status.Connecting)
+						return false;
+					if (!PollWithinBudget(client, elapsed, budgetMs)) return false;
+				}
+
+				// Connecting by hostname means HttpClient injects the correct Host itself,
+				// so no explicit Host header / TLS common-name override is needed here.
+				string[] headers =
+				{
+					"Content-Type: application/x-protobuf",
+					"Content-Encoding: gzip",
+					"X-API-Key: " + _apiKey,
+					"X-SDK-Version: " + _sdkVersion,
+				};
+				if (client.RequestRaw(HttpClient.Method.Post, target.Path, headers, payload) != Error.Ok)
+					return false;
+
+				while (client.GetStatus() == HttpClient.Status.Requesting)
+				{
+					if (!PollWithinBudget(client, elapsed, budgetMs)) return false;
+				}
+
+				int code = client.GetResponseCode();
+				bool ok = code >= 200 && code < 300;
+				if (ok)
+				{
+					if (VerboseLogging) GD.Print(TransportLog.FormatFlushSuccess(eventCount, code));
+				}
+				else
+				{
+					GD.PushWarning($"[Framedash] Shutdown drain send failed (HTTP {code}); dropping {eventCount} events.");
+				}
+				return ok;
+			}
+			finally
+			{
+				client.Close();
+			}
+		}
+
+		// Advance the HttpClient state machine once and sleep one poll interval unless the
+		// shared budget is already spent. Returns false when the budget is exhausted so
+		// the caller aborts. OS.DelayMsec blocks the calling thread -- acceptable ONLY
+		// because this path runs during teardown, never per frame.
+		private static bool PollWithinBudget(HttpClient client, Stopwatch elapsed, int budgetMs)
+		{
+			client.Poll();
+			if (elapsed.ElapsedMilliseconds >= budgetMs) return false;
+			OS.DelayMsec(BlockingPollMs);
+			return true;
 		}
 
 		private static byte[] Compress(byte[] data)

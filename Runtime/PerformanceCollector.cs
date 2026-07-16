@@ -23,6 +23,12 @@ namespace Framedash
             public float GpuTimeMs;
             public float GameThreadMs;
             public float RenderThreadMs;
+            // Raw GPU-memory monitor readings (bytes); 0 if unavailable/uncollected.
+            // MemMetricsBuilder decides omission (a raw 0 here never becomes a
+            // stuffed mem.* metric).
+            public double VramBytes;
+            public double TexturesBytes;
+            public double BuffersBytes;
         }
 
         // Real-time frame delta, computed from Time.GetTicksUsec() rather than
@@ -45,6 +51,13 @@ namespace Framedash
         // Collect() (which may run from a background Track() call) makes no native
         // Godot call off the main thread.
         private long _cachedMemoryUsedBytes;
+        // GPU-memory monitors (mem.* metrics), sampled alongside MemoryStatic for the
+        // same off-thread-safety reason. Kept as raw double bytes (Performance.GetMonitor's
+        // native return type); MemMetricsBuilder applies the omit-when-<=0 and range clamp
+        // rules when the heartbeat builds the metrics map.
+        private double _cachedVramBytes;
+        private double _cachedTexturesBytes;
+        private double _cachedBuffersBytes;
 
         // Guards all cached fields: UpdateFrameTimings writes them on the main thread while
         // Collect may read them from a background Track() call. The lock keeps each snapshot
@@ -155,6 +168,19 @@ namespace Framedash
                 {
                     _cachedMemoryUsedBytes = 0L;
                 }
+
+                // GPU-memory monitors: video/texture/buffer usage in bytes. Each is sampled
+                // independently (one failing must not blank the others) and left as raw 0
+                // on failure/unavailability -- MemMetricsBuilder treats <= 0 as "not
+                // collected" and omits the key rather than emitting a stuffed 0.
+                try { _cachedVramBytes = Performance.GetMonitor(Performance.Monitor.RenderVideoMemUsed); }
+                catch { _cachedVramBytes = 0.0; }
+
+                try { _cachedTexturesBytes = Performance.GetMonitor(Performance.Monitor.RenderTextureMemUsed); }
+                catch { _cachedTexturesBytes = 0.0; }
+
+                try { _cachedBuffersBytes = Performance.GetMonitor(Performance.Monitor.RenderBufferMemUsed); }
+                catch { _cachedBuffersBytes = 0.0; }
             }
         }
 
@@ -176,6 +202,9 @@ namespace Framedash
                     GpuTimeMs = _cachedGpuTimeMs,
                     GameThreadMs = _cachedGameThreadMs,
                     RenderThreadMs = _cachedRenderThreadMs,
+                    VramBytes = _cachedVramBytes,
+                    TexturesBytes = _cachedTexturesBytes,
+                    BuffersBytes = _cachedBuffersBytes,
                 };
             }
         }
