@@ -4,7 +4,21 @@ All notable changes to the Framedash Godot SDK are documented here. This project
 follows [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.1.6] - 2026-07-17
+
+- Restructure the public mirror so `plugin.cfg`, `Runtime/`, and
+  `FramedashEditorPlugin.cs` land under `addons/framedash/`, with `LICENSE` and
+  `README.md` duplicated there while the listing files remain at the repository
+  root. The Godot Asset Library installs repository zip paths directly under
+  `res://`, so this layout lets it register the plugin at
+  `res://addons/framedash/`. This is only a mirror packaging change in
+  `scripts/snapshot-sdk.ps1`; the runtime code and the flat `sdks/godot/`
+  monorepo source layout are unchanged, so existing addon users see no behavior
+  change.
+- Correct the installation order to build the project before enabling the
+  plugin. A C# `EditorPlugin` cannot be enabled until the project's assembly has
+  compiled its type; the previous steps incorrectly told readers to enable it
+  first.
 
 ## [0.1.5] - 2026-07-17
 
