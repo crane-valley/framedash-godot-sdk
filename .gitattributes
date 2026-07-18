@@ -1,0 +1,11 @@
+# Normalize line endings for all files that Git considers text files.
+* text=auto eol=lf
+
+# Only include the addons folder when downloading from the Asset Library.
+# The AssetLib zip is a git archive, which honors export-ignore -- without
+# these rules every repo root file would land inside the consumer project.
+# Snippet per the Godot submission guidelines:
+# https://docs.godotengine.org/en/latest/community/asset_library/submitting_to_assetlib.html#recommendations
+/**        export-ignore
+/addons    !export-ignore
+/addons/** !export-ignore
