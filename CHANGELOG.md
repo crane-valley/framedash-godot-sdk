@@ -4,6 +4,16 @@ All notable changes to the Framedash Godot SDK are documented here. This project
 follows [Keep a Changelog](https://keepachangelog.com/) and
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+## [0.1.7] - 2026-07-20
+
+### Changed
+
+- Updated the SDK release identifier after auditing ring-buffer eviction against
+  the persisted-prefix invariant. Godot has no offline persistence or restored
+  durable prefix, so no equivalent buffer behavior change was required.
+
 ## [0.1.6] - 2026-07-17
 
 - Restructure the public mirror so `plugin.cfg`, `Runtime/`, and
