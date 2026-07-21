@@ -1,0 +1,162 @@
+name: AssetLib Publish
+
+# Submits a Godot Asset Library edit for asset 5355 on every release tag, so the
+# listing's version_string + download_commit never drift behind the mirror. The
+# AssetLib edit was previously a manual post-release step outside the pipeline,
+# which is how the listing fell to 0.1.6 while the repo shipped 0.1.7.
+#
+# This file is generated into the mirror by scripts/snapshot-sdk.ps1 in the
+# private monorepo (crane-valley/framedash); edit it there, not here.
+#
+# ONE-TIME OWNER SETUP (required before the first tag push auto-submits):
+#   In THIS mirror repo -> Settings -> Secrets and variables -> Actions, add:
+#     ASSETLIB_USERNAME : the godotengine.org account that owns asset 5355
+#     ASSETLIB_PASSWORD : that account's password
+#   Until both are set the job FAILS (not skips) on purpose: a red release run is
+#   an actionable signal, whereas a silent skip would let the listing drift again
+#   -- the exact failure this workflow exists to prevent. The weekly drift check
+#   is only a backstop, not the primary path.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+concurrency:
+  group: assetlib-publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  ASSET_ID: "5355"
+  API_BASE: "https://godotengine.org/asset-library/api"
+  PLUGIN_CFG: "addons/framedash/plugin.cfg"
+
+jobs:
+  submit:
+    name: Submit AssetLib edit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # Full history + tags so the release tag's commit can be resolved as the
+          # canonical download_commit (see below).
+          fetch-depth: 0
+      - name: Submit version edit to the Asset Library
+        env:
+          EVENT_REF_TYPE: ${{ github.ref_type }}
+          EVENT_REF_NAME: ${{ github.ref_name }}
+          ASSETLIB_USERNAME: ${{ secrets.ASSETLIB_USERNAME }}
+          ASSETLIB_PASSWORD: ${{ secrets.ASSETLIB_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${ASSETLIB_USERNAME:-}" ] || [ -z "${ASSETLIB_PASSWORD:-}" ]; then
+            echo "::error::ASSETLIB_USERNAME / ASSETLIB_PASSWORD are not set on this repo. Set both secrets so release tags can auto-submit the Asset Library edit (see the header of this workflow)."
+            exit 1
+          fi
+
+          # Version source of truth = the addon's plugin.cfg (what Godot and the
+          # Asset Library read). Parse the first quoted version= line.
+          VERSION=$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$PLUGIN_CFG" | head -n1)
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not parse a quoted version= from $PLUGIN_CFG"
+            exit 1
+          fi
+          TAG="v$VERSION"
+
+          # On a tag push the tag name MUST equal v<plugin.cfg version>. A stray tag
+          # would otherwise auto-submit a version_string that disagrees with the tag,
+          # and the drift guard -- which keys off v$VERSION -- would then fail forever.
+          # Validate before any external API call (fail closed).
+          if [ "${EVENT_REF_TYPE:-}" = "tag" ] && [ "${EVENT_REF_NAME:-}" != "$TAG" ]; then
+            echo "::error::Tag $EVENT_REF_NAME does not match plugin.cfg version ($TAG). Refusing to submit an AssetLib edit."
+            exit 1
+          fi
+
+          # Canonical download_commit = the commit the release TAG points at, NOT
+          # github.sha. On workflow_dispatch github.sha is the dispatched branch HEAD
+          # (e.g. the commit that added this workflow after the tag), which the drift
+          # guard would never match because it compares against v$VERSION's commit.
+          # Resolving the tag here keeps publish and drift in agreement by construction.
+          if ! git rev-parse -q --verify "refs/tags/$TAG^{commit}" >/dev/null; then
+            echo "::error::Tag $TAG not found. Create and push the release tag before submitting the AssetLib edit."
+            exit 1
+          fi
+          COMMIT_SHA=$(git rev-parse "refs/tags/$TAG^{commit}")
+          echo "Target: asset $ASSET_ID -> version_string=$VERSION download_commit=$COMMIT_SHA"
+
+          # Idempotency: skip only when the live listing already matches BOTH the
+          # version and the commit -- a version-only match with a stale commit still
+          # ships the wrong archive and must be re-submitted.
+          #
+          # Known limitation (Codex P2): while an edit sits in moderation the GET
+          # still reports the OLD values, and the public API has no endpoint to list
+          # pending edits by asset and no upsert -- POST /asset/{id} always inserts a
+          # new edit. So a manual workflow_dispatch re-run during the moderation
+          # window would queue a DUPLICATE edit. This is accepted, not worked around:
+          # the automated path is the push trigger, which fires exactly once per
+          # release tag; before manually re-dispatching, check the asset page for an
+          # already-pending edit (the drift issue says so too).
+          ASSET_JSON=$(curl -fsS "$API_BASE/asset/$ASSET_ID")
+          LIVE_VERSION=$(echo "$ASSET_JSON" | jq -r '.version_string // ""')
+          LIVE_COMMIT=$(echo "$ASSET_JSON" | jq -r '.download_commit // ""')
+          echo "Live listing: version_string=${LIVE_VERSION:-<none>} download_commit=${LIVE_COMMIT:-<none>}"
+
+          # Downgrade guard: re-pushing an old release tag (v0.1.6 while the listing
+          # is already 0.1.7) would otherwise pass every check above and submit an
+          # edit that rolls the public listing BACK. Refuse when the target version
+          # sorts strictly below the live version. Equal versions are allowed (a
+          # commit-only re-submit) and fall through to the idempotency check.
+          #
+          # Restricted to plain X.Y.Z. The SDK versions its releases as X.Y.Z, and
+          # `sort -V` orders a SemVer prerelease (1.0.0-rc.1) ABOVE its final release
+          # (1.0.0), so applying it to a suffixed version could false-refuse a
+          # legitimate release. If either side is not plain X.Y.Z the ordering is
+          # not trustworthy here, so skip the refusal and warn instead.
+          SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+$'
+          if [ -n "$LIVE_VERSION" ] && [ "$VERSION" != "$LIVE_VERSION" ]; then
+            if echo "$VERSION" | grep -Eq "$SEMVER_RE" && echo "$LIVE_VERSION" | grep -Eq "$SEMVER_RE"; then
+              HIGHER=$(printf '%s\n%s\n' "$VERSION" "$LIVE_VERSION" | sort -V | tail -n1)
+              if [ "$HIGHER" != "$VERSION" ]; then
+                echo "::error::Target version $VERSION is older than the live listing $LIVE_VERSION; refusing to downgrade asset $ASSET_ID."
+                exit 1
+              fi
+            else
+              echo "::warning::Skipping the downgrade guard: $VERSION or $LIVE_VERSION is not plain X.Y.Z, so ordering is not reliable."
+            fi
+          fi
+
+          if [ "$LIVE_VERSION" = "$VERSION" ] && [ "$LIVE_COMMIT" = "$COMMIT_SHA" ]; then
+            echo "Asset $ASSET_ID already at $VERSION @ $COMMIT_SHA; no edit needed."
+            exit 0
+          fi
+
+          # Login -> token. --arg keeps credentials out of argv and JSON-escapes them.
+          TOKEN=$(jq -n --arg u "$ASSETLIB_USERNAME" --arg p "$ASSETLIB_PASSWORD" \
+            '{username:$u, password:$p}' \
+            | curl -fsS -X POST -H 'Content-Type: application/json' \
+                --data @- "$API_BASE/login" \
+            | jq -r '.token // ""')
+          if [ -z "$TOKEN" ]; then
+            echo "::error::Login to the Asset Library failed (no token returned). Check ASSETLIB_USERNAME / ASSETLIB_PASSWORD."
+            exit 1
+          fi
+
+          # For an existing asset all fields are optional; submitting only the two
+          # changed fields creates a pending edit (moderator-approved before it
+          # goes live). Response is {"id": "<edit id>"} on success.
+          RESPONSE=$(jq -n --arg t "$TOKEN" --arg v "$VERSION" --arg c "$COMMIT_SHA" \
+            '{token:$t, version_string:$v, download_commit:$c}' \
+            | curl -fsS -X POST -H 'Content-Type: application/json' \
+                --data @- "$API_BASE/asset/$ASSET_ID")
+          EDIT_ID=$(echo "$RESPONSE" | jq -r '.id // ""')
+          if [ -z "$EDIT_ID" ]; then
+            echo "::error::Edit submission was rejected: $RESPONSE"
+            exit 1
+          fi
+          echo "Submitted AssetLib edit $EDIT_ID for asset $ASSET_ID (pending moderation)."

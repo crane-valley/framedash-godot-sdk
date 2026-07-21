@@ -1,0 +1,155 @@
+name: AssetLib Drift Check
+
+# Weekly guard that the Godot Asset Library listing (asset 5355) still matches the
+# version this repo ships in addons/framedash/plugin.cfg. Backstop for the
+# AssetLib Publish workflow: if an auto-submit is missed, rejected, or reverted,
+# the listing silently falls behind (how it drifted to 0.1.6 vs 0.1.7). No
+# credentials -- the GET endpoint is public.
+#
+# This file is generated into the mirror by scripts/snapshot-sdk.ps1 in the
+# private monorepo (crane-valley/framedash); edit it there, not here.
+#
+# OPERATOR NOTE: GitHub disables a repo's scheduled workflows after 60 days with
+# no commit to the default branch. The exposure here is small -- a release is the
+# only thing that can move the listing out of sync, and every release pushes a
+# fresh snapshot to this mirror, which resets that clock; a 60-day-idle mirror has
+# had no release and so has nothing to drift to. If a long release drought does
+# disable this check, re-enable it from the repo Actions tab (or
+# `gh workflow enable assetlib-drift.yml`).
+
+on:
+  schedule:
+    # Weekly, Monday 06:00 UTC. Drift is low-frequency (only after a release), so
+    # a weekly cadence is enough and keeps scheduled minutes negligible.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: assetlib-drift
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  ASSET_ID: "5355"
+  API_BASE: "https://godotengine.org/asset-library/api"
+  PLUGIN_CFG: "addons/framedash/plugin.cfg"
+  # A fresh release edit sits in AssetLib moderation for a while, so a brand-new
+  # version legitimately mismatches the live listing. Only treat a mismatch as
+  # real drift once the release tag is older than this many days.
+  MODERATION_GRACE_DAYS: "3"
+
+jobs:
+  check:
+    name: Compare listing vs plugin.cfg
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # Full history + tags so the release tag's age can gate the moderation
+          # grace window below.
+          fetch-depth: 0
+      - name: Detect drift and open/update an issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          VERSION=$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$PLUGIN_CFG" | head -n1)
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not parse a quoted version= from $PLUGIN_CFG"
+            exit 1
+          fi
+
+          # Read both fields the editor relies on: version_string is what users see,
+          # download_commit is what the AssetLib download URL is built from. A stale
+          # commit with a matching version still ships the wrong archive, so both are
+          # compared (Codex P1).
+          ASSET_JSON=$(curl -fsS "$API_BASE/asset/$ASSET_ID")
+          LIVE_VERSION=$(echo "$ASSET_JSON" | jq -r '.version_string // ""')
+          LIVE_COMMIT=$(echo "$ASSET_JSON" | jq -r '.download_commit // ""')
+
+          # The listing points at the release tag's commit, so the expected commit is
+          # whatever v$VERSION resolves to (only checkable when the tag exists).
+          TAG="v$VERSION"
+          EXPECTED_COMMIT=""
+          TAG_EXISTS=false
+          if git rev-parse -q --verify "refs/tags/$TAG^{commit}" >/dev/null; then
+            TAG_EXISTS=true
+            EXPECTED_COMMIT=$(git rev-parse "refs/tags/$TAG^{commit}")
+          fi
+
+          echo "Repo plugin.cfg version: $VERSION"
+          echo "Live AssetLib version:   ${LIVE_VERSION:-<none>}"
+          echo "Expected commit ($TAG):  ${EXPECTED_COMMIT:-<no tag>}"
+          echo "Live AssetLib commit:    ${LIVE_COMMIT:-<none>}"
+
+          VERSION_OK=false; [ "$LIVE_VERSION" = "$VERSION" ] && VERSION_OK=true
+          # Commit only participates when the tag exists to resolve an expected SHA.
+          COMMIT_OK=true
+          if [ "$TAG_EXISTS" = true ] && [ "$LIVE_COMMIT" != "$EXPECTED_COMMIT" ]; then
+            COMMIT_OK=false
+          fi
+
+          if [ "$VERSION_OK" = true ] && [ "$COMMIT_OK" = true ]; then
+            if [ "$TAG_EXISTS" = true ]; then
+              echo "In sync (version and commit); nothing to do."
+            else
+              # Version matches but there is no tag to resolve an expected commit,
+              # so download_commit is unverified. Surface it rather than claiming a
+              # full sync -- but do not page: a correct version_string means the
+              # listing is not behind, and a missing tag is an anomaly, not drift.
+              echo "::warning::AssetLib version matches ($VERSION) but tag $TAG is missing, so download_commit (${LIVE_COMMIT:-<none>}) could not be verified."
+            fi
+            exit 0
+          fi
+
+          # Mismatch. Suppress the alert while the release tag is inside the
+          # moderation grace window (an edit may still be pending review).
+          if [ "$TAG_EXISTS" = true ]; then
+            TAG_EPOCH=$(git log -1 --format=%ct "$TAG")
+            # Compare in seconds, not truncated days: an integer day count would
+            # stretch a 3-day grace to nearly 4 real days and delay detection.
+            AGE_SECONDS=$(( $(date -u +%s) - TAG_EPOCH ))
+            GRACE_SECONDS=$(( MODERATION_GRACE_DAYS * 86400 ))
+            echo "Tag $TAG age: ${AGE_SECONDS}s (grace ${GRACE_SECONDS}s)"
+            if [ "$AGE_SECONDS" -lt "$GRACE_SECONDS" ]; then
+              echo "::warning::AssetLib listing (version ${LIVE_VERSION:-<none>}, commit ${LIVE_COMMIT:-<none>}) does not yet match repo (version $VERSION, commit ${EXPECTED_COMMIT:-<none>}); within the ${MODERATION_GRACE_DAYS}-day moderation window, not alerting yet."
+              exit 0
+            fi
+          else
+            # No matching tag means this version was never released as a mirror
+            # tag, so the moderation window does not apply -- treat as drift.
+            echo "No tag $TAG found; skipping grace window."
+          fi
+
+          # Real drift. Open a fresh issue or update the existing open one (stable
+          # title so repeated runs never pile up duplicates).
+          TITLE="AssetLib version drift: asset $ASSET_ID"
+          BODY=$(printf '%s\n' \
+            "The Godot Asset Library listing has drifted from this repo." \
+            "" \
+            "- Repo version (addons/framedash/plugin.cfg): \`$VERSION\`" \
+            "- Live AssetLib version (asset $ASSET_ID): \`${LIVE_VERSION:-<none>}\`" \
+            "- Expected commit (tag $TAG): \`${EXPECTED_COMMIT:-<no tag>}\`" \
+            "- Live AssetLib download_commit: \`${LIVE_COMMIT:-<none>}\`" \
+            "" \
+            "Fix: run the \"AssetLib Publish\" workflow (workflow_dispatch) to re-submit the edit, then confirm the pending edit is approved by a moderator. Before re-running, check https://godotengine.org/asset-library/asset/$ASSET_ID for an already-pending edit -- the public API cannot upsert one, so a second submit queues a duplicate." \
+            "" \
+            "Detected by the weekly AssetLib Drift Check on $(date -u +%Y-%m-%dT%H:%M:%SZ).")
+
+          EXISTING=$(gh issue list --state open --search "in:title \"$TITLE\"" --json number,title \
+            --jq "[.[] | select(.title == \"$TITLE\")] | .[0].number // empty")
+          if [ -n "$EXISTING" ]; then
+            echo "Updating existing issue #$EXISTING"
+            gh issue comment "$EXISTING" --body "$BODY"
+          else
+            echo "Opening new drift issue"
+            gh issue create --title "$TITLE" --body "$BODY"
+          fi
+
+          echo "::error::AssetLib listing (${LIVE_VERSION:-<none>}) is behind the repo ($VERSION)."
+          exit 1
