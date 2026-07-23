@@ -38,6 +38,37 @@ After the first build, enabling the plugin registers a **Framedash** autoload si
 | `SamplingPolicy.cs` | Configurable event sampling and throttling |
 | `EventBuffer.cs` | Batched event buffering before transmission, default 10,000 events |
 | `IoStats.cs` | Thread-safe accumulator for manually-reported disk I/O samples (`ReportIoSample`) |
+| `Editor/` | Editor-only cloud heatmap controls, secure REST client, and cached voxel overlay |
+
+## In-Editor Cloud Heatmap
+
+Enabling the plugin adds a **Framedash Heatmap** dock to the Godot editor. It
+loads server-aggregated cloud heatmap cells and renders them in the 3D editor at
+their recorded world coordinates; it does not replay local files or run
+per-cell physics traces.
+
+1. Create an API key with the `analytics:read` scope. Do not use the game's
+   write-only ingest key.
+2. Enter the read key, Framedash project ID, and API base URL in the dock. As an
+   alternative to typing the key, set `FRAMEDASH_ANALYTICS_API_KEY` before
+   launching Godot.
+3. Select the time range and cell size, then choose **Refresh Maps**.
+4. Select a map and choose **Fetch Heatmap**.
+5. Enable **Show** and use **Frame Heatmap** to focus the 3D editor camera.
+
+XYZ responses render as translucent voxels, preserving load at different
+heights. Older API responses without `z` remain visible as flat cells. The
+five-stop blue-to-red palette is normalized to the highest returned cell, and
+the dock reports both cell count and maximum weight. Framedash requests at most
+the API's 10,000-cell aggregate; drawing uses one cached mesh rather than a node
+or trace per cell.
+
+The overlay is off by default, remains owned by the editor plugin when the dock
+is rearranged, hides automatically while a game is running, and restores after
+play stops. Settings and the optional typed read key are stored under Godot's
+per-project `.godot/editor/editor_layout.cfg` metadata, not `project.godot`.
+Keep `.godot/` excluded from version control. All heatmap code is guarded by
+`TOOLS`, so it and the read key are excluded from exported games.
 
 ## Automatic Events
 
