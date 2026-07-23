@@ -47,7 +47,7 @@ namespace Framedash
         // gets captured into saved scenes/autoload state and would deserialize the
         // OLD value over this initializer after an addon upgrade, leaving the
         // X-SDK-Version header stale. Keep in sync with plugin.cfg (release gotcha).
-        public const string SdkVersion = "0.1.7";
+        public const string SdkVersion = "0.1.8";
         private string _playerId = "";
         [Export]
         public string PlayerId

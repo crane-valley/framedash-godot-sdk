@@ -6,6 +6,30 @@ follows [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-07-24
+
+### Added
+
+- Add an editor-only **Framedash Heatmap** dock that fetches maps and up to
+  10,000 server-aggregated cells with an `analytics:read` key, then renders
+  measured XYZ data as a cached translucent voxel mesh in the 3D editor. The
+  overlay uses the shared five-stop blue-to-red palette, keeps older responses
+  without `z` visible as flat cells, and includes Show, Frame Heatmap, opacity,
+  Z offset, event/time/cell filters, legend, cell count, and maximum weight
+  controls.
+- Add engine-independent NUnit coverage for map/heatmap parsing, exact map
+  selection restore, five-stop colors, voxel and flat topology, cached bounds,
+  query encoding with `includeZ=true`, and redirect-origin checks.
+
+### Changed
+
+- Persist heatmap controls in Godot's per-project editor metadata and support
+  the non-persistent `FRAMEDASH_ANALYTICS_API_KEY` fallback. The editor blocks
+  redirects before forwarding the read key, hides the overlay while a game is
+  running, and restores it after play stops.
+- Include the new `Editor/` sources under `addons/framedash/` in public mirror
+  snapshots while continuing to exclude monorepo-only NUnit tests.
+
 ## [0.1.7] - 2026-07-20
 
 ### Changed
