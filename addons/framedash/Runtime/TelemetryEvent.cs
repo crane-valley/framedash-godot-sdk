@@ -2,7 +2,6 @@ using System.Collections.Generic;
 
 namespace Framedash
 {
-    /// <summary>Source of the telemetry event.</summary>
     public enum TelemetrySource
     {
         Unspecified = 0,
@@ -10,7 +9,6 @@ namespace Framedash
         Automated = 2,
     }
 
-    /// <summary>Serializable key-value pair for string attributes.</summary>
     [System.Serializable]
     public struct StringPair
     {
@@ -19,7 +17,6 @@ namespace Framedash
         public StringPair(string key, string value) { Key = key; Value = value; }
     }
 
-    /// <summary>Serializable key-value pair for float metrics.</summary>
     [System.Serializable]
     public struct FloatPair
     {
@@ -28,7 +25,6 @@ namespace Framedash
         public FloatPair(string key, float value) { Key = key; Value = value; }
     }
 
-    /// <summary>A single telemetry event ready for batching and serialization.</summary>
     [System.Serializable]
     public struct TelemetryEvent
     {

@@ -10,7 +10,7 @@ namespace Framedash
     /// (ConnectToHost + RequestRaw) rather than the HttpRequest scene-tree node, so it
     /// needs the host / port / TLS flag / request path split out explicitly instead of
     /// a single URL. Kept engine-independent (only System.Uri) so the parsing is
-    /// NUnit-testable -- getting the default port and the path+query right is the part
+    /// NextUnit-testable -- getting the default port and the path+query right is the part
     /// worth a test, not the engine call.
     /// </summary>
     public readonly struct BlockingRequestTarget
@@ -19,7 +19,6 @@ namespace Framedash
         public int Port { get; }
         public bool UseTls { get; }
 
-        /// <summary>Request path including query, always non-empty (at least "/").</summary>
         public string Path { get; }
 
         private BlockingRequestTarget(string host, int port, bool useTls, string path)
@@ -31,12 +30,11 @@ namespace Framedash
         }
 
         /// <summary>
-        /// Parse an absolute http/https endpoint into HttpClient connection parameters.
-        /// Returns false for a relative URL or a non-http(s) scheme so the caller drops
-        /// the drain rather than dialing an unsupported target (fail-safe). The host is
-        /// the DNS-safe form (unbracketed for an IPv6 literal, which is what
-        /// HttpClient.ConnectToHost expects). Port falls back to the scheme default
-        /// (443/80) via System.Uri when the URL omits it.
+        /// Returns false for a relative URL or a non-http(s) scheme so the caller drops the
+        /// drain rather than dialing an unsupported target (fail-safe). The host is the
+        /// DNS-safe form (unbracketed for an IPv6 literal, which is what
+        /// HttpClient.ConnectToHost expects). Port falls back to the scheme default (443/80)
+        /// via System.Uri when the URL omits it.
         /// </summary>
         public static bool TryParse(string? endpointUrl, out BlockingRequestTarget target)
         {

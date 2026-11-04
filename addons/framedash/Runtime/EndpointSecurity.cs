@@ -6,7 +6,7 @@ namespace Framedash
 {
     /// <summary>
     /// Engine-independent endpoint URL security checks for telemetry transport.
-    /// Kept free of engine (Godot) types so it can be unit-tested under NUnit.
+    /// Kept free of engine types so it can be unit-tested under NextUnit.
     /// </summary>
     public static class EndpointSecurity
     {
@@ -16,31 +16,29 @@ namespace Framedash
         private static readonly char[] AuthorityDelimiters = { '/', '?', '#', '\\' };
 
         /// <summary>
-        /// Whether it is safe to send the API key to this endpoint. HTTPS is
-        /// always allowed; plain HTTP is allowed only for a canonical loopback host
-        /// (localhost / 127.0.0.1 / [::1]), matching the UE5 SDK's exact textual
-        /// allowlist. A substring test such as StartsWith("http://localhost") would
-        /// accept hostile URLs like "http://localhost.attacker.com" or
-        /// "http://localhost@evil.example" and leak the API key in cleartext to a
-        /// non-loopback host.
+        /// HTTPS is always allowed; plain HTTP is allowed only for a canonical loopback host
+        /// (localhost / 127.0.0.1 / [::1]), matching the UE5 SDK's exact textual allowlist. A
+        /// substring test such as StartsWith("http://localhost") would accept hostile URLs like
+        /// "http://localhost.attacker.com" or "http://localhost@evil.example" and leak the API
+        /// key in cleartext to a non-loopback host.
         /// </summary>
         public static bool IsEndpointTransportSecure(string? endpointUrl)
         {
             if (string.IsNullOrEmpty(endpointUrl)) return false;
             // Reject control characters (incl. embedded NUL): a real URL never
             // contains raw control bytes, and a NUL could truncate the string in
-            // the native HTTP client (Godot's HttpRequest) and open a
-            // parser differential. Matches the UE5 validator.
+            // the native HTTP client and open a parser differential. Matches the
+            // UE5 validator.
             foreach (char c in endpointUrl)
             {
                 if (c < ' ' || c == (char)0x7f) return false;
             }
             // Reject userinfo '@' and backslash. Telemetry endpoints never use
             // them, and System.Uri (WHATWG: '\' -> '/') resolves a different host
-            // than the platform HTTP client (libcurl/RFC 3986 splits at the last
-            // '@'), so "http://localhost\@evil.com" would pass the loopback check
-            // here yet send the key in cleartext to evil.com. Refusing both closes
-            // the gap (and lets the raw-host parse below assume no userinfo).
+            // than a platform HTTP client that follows RFC 3986 and splits at the
+            // last '@', so "http://localhost\@evil.com" would pass the loopback
+            // check here yet send the key in cleartext to evil.com. Refusing both
+            // closes the gap (and lets the raw-host parse below assume no userinfo).
             if (endpointUrl.IndexOf('@') >= 0 || endpointUrl.IndexOf('\\') >= 0) return false;
             if (!Uri.TryCreate(endpointUrl, UriKind.Absolute, out var uri)) return false;
             if (uri.Scheme == Uri.UriSchemeHttps) return true;
@@ -62,12 +60,10 @@ namespace Framedash
         }
 
         /// <summary>
-        /// Extract the lowercased host from a URL using the original text, dropping
-        /// the scheme, userinfo, port, and path/query/fragment. IPv6 literals keep
-        /// their brackets (e.g. "[::1]"). Returns an empty string for a malformed
-        /// authority (e.g. trailing text after an IPv6 "]"). Mirrors the UE5
-        /// ExtractUrlHost step for step so the two SDKs accept exactly the same set,
-        /// and is correct on its own (does not rely on the caller's '@'/'\' rejection).
+        /// IPv6 literals keep their brackets (e.g. "[::1]"). Returns an empty string for a
+        /// malformed authority (e.g. trailing text after an IPv6 "]"). Mirrors the UE5
+        /// ExtractUrlHost step for step so the two SDKs accept exactly the same set, and is
+        /// correct on its own (does not rely on the caller's '@'/'\' rejection).
         /// </summary>
         private static string ExtractRawHost(string url)
         {
@@ -90,7 +86,7 @@ namespace Framedash
             if (authority.Length > 0 && authority[0] == '[')
             {
                 int close = authority.IndexOf(']');
-                if (close < 0) return string.Empty; // unterminated bracket -> malformed
+                if (close < 0) return string.Empty;
                 // Anything between ']' and the optional ":port" is malformed -- fail
                 // closed so "[::1].evil" cannot pose as the loopback literal.
                 if (close + 1 < authority.Length && authority[close + 1] != ':') return string.Empty;
@@ -112,6 +108,18 @@ namespace Framedash
         // folding, and the allowlist is ASCII.
         private static string ToLowerAscii(string s)
         {
+            bool hasUpper = false;
+            for (int i = 0; i < s.Length; i++)
+            {
+                char c = s[i];
+                if (c >= 'A' && c <= 'Z')
+                {
+                    hasUpper = true;
+                    break;
+                }
+            }
+            if (!hasUpper) return s;
+
             char[] buf = s.ToCharArray();
             for (int i = 0; i < buf.Length; i++)
             {

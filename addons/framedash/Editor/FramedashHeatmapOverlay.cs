@@ -22,6 +22,7 @@ namespace Framedash.Editor
         private bool _hasBounds;
         private bool _enabled;
         private bool _playing;
+        private FramedashEditorLogic.MapInfo? _map;
         private float _zOffset;
 
         public int CellCount => _renderCells.Count;
@@ -42,6 +43,7 @@ namespace Framedash.Editor
             {
                 return;
             }
+            _map = map;
 
             int count = Math.Min(cells.Count, MaxCells);
             double maxWeight = FramedashEditorLogic.FindMaxWeight(cells);
@@ -149,13 +151,15 @@ namespace Framedash.Editor
             {
                 return false;
             }
+            Vector3 minimum = ToWorld(_baseBounds.MinX, _baseBounds.MinY, _baseBounds.MinZ + _zOffset);
+            Vector3 maximum = ToWorld(_baseBounds.MaxX, _baseBounds.MaxY, _baseBounds.MaxZ + _zOffset);
             bounds = new FramedashEditorLogic.HeatmapBoundsData(
-                _baseBounds.MinX,
-                _baseBounds.MinY,
-                _baseBounds.MinZ + _zOffset,
-                _baseBounds.MaxX,
-                _baseBounds.MaxY,
-                _baseBounds.MaxZ + _zOffset);
+                minimum.X,
+                minimum.Y,
+                minimum.Z,
+                maximum.X,
+                maximum.Y,
+                maximum.Z);
             return true;
         }
 
@@ -190,12 +194,7 @@ namespace Framedash.Editor
             var colors = new Color[geometry.Colors.Length];
             for (int i = 0; i < vertices.Length; i++)
             {
-                // Track() records GlobalPosition.X/Y/Z without an axis transform.
-                // Rendering those same coordinates prevents editor-only drift.
-                vertices[i] = new Vector3(
-                    (float)geometry.X[i],
-                    (float)geometry.Y[i],
-                    (float)geometry.Z[i]);
+                vertices[i] = ToWorld(geometry.X[i], geometry.Y[i], geometry.Z[i]);
                 FramedashEditorLogic.HeatmapRgba rgba = geometry.Colors[i];
                 colors[i] = new Color(rgba.R, rgba.G, rgba.B, rgba.A);
             }
@@ -214,6 +213,13 @@ namespace Framedash.Editor
             {
                 _instance!.Mesh = _mesh;
             }
+        }
+
+        private Vector3 ToWorld(double groundX, double groundY, double height)
+        {
+            FramedashEditorLogic.MapPlaneToEngine(
+                _map, groundX, groundY, height, out double x, out double y, out double z);
+            return new Vector3((float)x, (float)y, (float)z);
         }
 
         private StandardMaterial3D EnsureMaterial()
@@ -244,7 +250,7 @@ namespace Framedash.Editor
                 return;
             }
 
-            _instance!.Position = new Vector3(0, 0, _zOffset);
+            _instance!.Position = ToWorld(0, 0, _zOffset);
             _instance.Visible = _enabled
                 && !_playing
                 && _mesh != null

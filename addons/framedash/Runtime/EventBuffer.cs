@@ -2,10 +2,6 @@ using Godot;
 
 namespace Framedash
 {
-    /// <summary>
-    /// Thread-safe ring buffer for telemetry events.
-    /// When full, oldest events are dropped (game perf > telemetry completeness).
-    /// </summary>
     public sealed class EventBuffer
     {
         private readonly TelemetryEvent[] _buffer;
@@ -34,7 +30,6 @@ namespace Framedash
             _buffer = new TelemetryEvent[capacity];
         }
 
-        /// <summary>Add an event. Drops oldest if full.</summary>
         public void Enqueue(TelemetryEvent evt)
         {
             lock (_lock)
@@ -44,7 +39,6 @@ namespace Framedash
 
                 if (_count == _buffer.Length)
                 {
-                    // Ring buffer full — advance head (drop oldest)
                     _head = (_head + 1) % _buffer.Length;
                     _droppedCount++;
 
@@ -60,7 +54,6 @@ namespace Framedash
             }
         }
 
-        /// <summary>Dequeue all buffered events and reset.</summary>
         public TelemetryEvent[] DequeueAll()
         {
             lock (_lock)
@@ -72,7 +65,7 @@ namespace Framedash
                 {
                     int idx = (_head + i) % _buffer.Length;
                     result[i] = _buffer[idx];
-                    _buffer[idx] = default; // Release references for GC
+                    _buffer[idx] = default;
                 }
 
                 _head = 0;

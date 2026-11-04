@@ -1,21 +1,14 @@
 name: AssetLib Drift Check
 
-# Weekly guard that the Godot Asset Library listing (asset 5355) still matches the
-# version this repo ships in addons/framedash/plugin.cfg. Backstop for the
-# AssetLib Publish workflow: if an auto-submit is missed, rejected, or reverted,
-# the listing silently falls behind (how it drifted to 0.1.6 vs 0.1.7). No
-# credentials -- the GET endpoint is public.
+# This file is generated into the mirror by scripts/snapshot-sdk.ps1 in the private monorepo
+# (crane-valley/framedash); edit it there, not here.
 #
-# This file is generated into the mirror by scripts/snapshot-sdk.ps1 in the
-# private monorepo (crane-valley/framedash); edit it there, not here.
-#
-# OPERATOR NOTE: GitHub disables a repo's scheduled workflows after 60 days with
-# no commit to the default branch. The exposure here is small -- a release is the
-# only thing that can move the listing out of sync, and every release pushes a
-# fresh snapshot to this mirror, which resets that clock; a 60-day-idle mirror has
-# had no release and so has nothing to drift to. If a long release drought does
-# disable this check, re-enable it from the repo Actions tab (or
-# `gh workflow enable assetlib-drift.yml`).
+# OPERATOR NOTE: GitHub disables a repo's scheduled workflows after 60 days with no commit to
+# the default branch. The exposure here is small -- a release is the only thing that can move
+# the listing out of sync, and every release pushes a fresh snapshot to this mirror, which
+# resets that clock; a 60-day-idle mirror has had no release and so has nothing to drift to. If
+# a long release drought does disable this check, re-enable it from the repo Actions tab (or `gh
+# workflow enable assetlib-drift.yml`).
 
 on:
   schedule:
@@ -47,7 +40,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           # Full history + tags so the release tag's age can gate the moderation
           # grace window below.
