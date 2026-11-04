@@ -9,7 +9,6 @@ namespace Framedash
     /// </summary>
     public static class CameraMath
     {
-        /// <summary>Normalize a yaw angle (degrees) to [0, 360).</summary>
         public static float NormalizeYaw(float yawDegrees)
         {
             float r = yawDegrees % 360f;
@@ -24,7 +23,7 @@ namespace Framedash
         /// Derive wire-convention (yaw, pitch) from a camera forward direction vector.
         /// Godot is +Y up, -Z forward, right-handed. Yaw 0 = the default forward axis (-Z),
         /// increasing clockwise when viewed from above; pitch +90 = looking up. Returns
-        /// (0, 0) for a zero-length vector. Engine-independent so it is NUnit-testable.
+        /// (0, 0) for a zero-length vector. Engine-independent so it is NextUnit-testable.
         /// </summary>
         public static void YawPitchFromForward(float fx, float fy, float fz, out float yaw, out float pitch)
         {
@@ -36,11 +35,8 @@ namespace Framedash
                 return;
             }
             float len = (float)Math.Sqrt(lenSq);
-            // Heading: -Z is forward (yaw 0). atan2(x, -z) gives 0 at -Z, +90 at +X (right/East),
-            // +180 at +Z, +270 at -X — clockwise from above. Normalize to [0, 360).
             float rawYaw = (float)(Math.Atan2(fx, -fz) * (180.0 / Math.PI));
             yaw = NormalizeYaw(rawYaw);
-            // Pitch from the vertical component; +Y up => positive pitch (looking up).
             float ny = fy / len;
             if (ny > 1f) ny = 1f;
             if (ny < -1f) ny = -1f;
@@ -50,11 +46,8 @@ namespace Framedash
             pitch = p;
         }
 
-        // A yaw quantum value outside the valid [0, 36000) range, used as the
-        // "no camera this frame" sentinel in the high half of a packed snapshot.
         private const long AbsentYawQuantum = 0xFFFFFFFFL;
 
-        /// <summary>The packed value meaning "no camera captured this frame".</summary>
         public const long CameraAbsent = AbsentYawQuantum << 32;
 
         /// <summary>
@@ -76,10 +69,6 @@ namespace Framedash
             return (y << 32) | p;
         }
 
-        /// <summary>
-        /// Unpack a value produced by <see cref="PackCamera"/>. Returns false (with
-        /// yaw=pitch=0) when the snapshot is the <see cref="CameraAbsent"/> sentinel.
-        /// </summary>
         public static bool TryUnpackCamera(long packed, out float yaw, out float pitch)
         {
             long y = (packed >> 32) & 0xFFFFFFFFL;

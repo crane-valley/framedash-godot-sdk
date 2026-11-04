@@ -8,14 +8,9 @@ using Godot;
 namespace Framedash
 {
     /// <summary>
-    /// Editor-only plugin that wires the Framedash telemetry SDK into the host
-    /// project and owns the cloud heatmap dock and viewport overlay. Enabling
-    /// the plugin registers the "Framedash" autoload; disabling it removes the
-    /// registration and editor visualization.
-    ///
-    /// The entire class is guarded by #if TOOLS so it compiles out of exported
-    /// games -- only the editor build defines the TOOLS symbol. The autoload
-    /// itself (TelemetrySDK) still ships in exported games.
+    /// The entire class is guarded by #if TOOLS so it compiles out of exported games -- only
+    /// the editor build defines the TOOLS symbol. The autoload itself (TelemetrySDK) still
+    /// ships in exported games.
     /// </summary>
     [Tool]
     public partial class FramedashEditorPlugin : EditorPlugin
@@ -27,11 +22,38 @@ namespace Framedash
         private FramedashHeatmapController? _heatmapController;
         private bool _heatmapLayoutRestored;
 
-        public override void _EnterTree()
+        public override void _EnablePlugin()
         {
             try
             {
                 AddAutoloadSingleton(AutoloadName, AutoloadPath);
+            }
+            catch (Exception exception)
+            {
+                GD.PushError(
+                    "[Framedash] Autoload registration failed: "
+                    + exception);
+            }
+        }
+
+        public override void _DisablePlugin()
+        {
+            try
+            {
+                RemoveAutoloadSingleton(AutoloadName);
+            }
+            catch (Exception exception)
+            {
+                GD.PushError(
+                    "[Framedash] Autoload removal failed: "
+                    + exception);
+            }
+        }
+
+        public override void _EnterTree()
+        {
+            try
+            {
                 _heatmapController = new FramedashHeatmapController(
                     this,
                     _heatmapSettings);
@@ -59,7 +81,6 @@ namespace Framedash
                 SceneChanged -= OnSceneChanged;
                 _heatmapController?.Shutdown();
                 _heatmapController = null;
-                RemoveAutoloadSingleton(AutoloadName);
             }
             catch (Exception exception)
             {

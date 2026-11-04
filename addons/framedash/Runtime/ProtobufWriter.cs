@@ -13,7 +13,6 @@ namespace Framedash
     /// </summary>
     public sealed class ProtobufWriter : IDisposable
     {
-        // Wire type constants
         private const int WireVarint = 0;
         private const int Wire64Bit = 1;
         private const int WireLengthDelimited = 2;
@@ -38,17 +37,14 @@ namespace Framedash
             _utf8Buffer = ArrayPool<byte>.Shared.Rent(DefaultUtf8BufferCapacity);
         }
 
-        /// <summary>Current byte length of the written data.</summary>
         public int Length => _length;
 
-        /// <summary>Reset the writer for reuse.</summary>
         public void Reset()
         {
             if (_disposed) return;
             _length = 0;
         }
 
-        /// <summary>Return the written bytes as a new array.</summary>
         public byte[] ToArray()
         {
             if (_disposed) return Array.Empty<byte>();
@@ -59,7 +55,6 @@ namespace Framedash
             return result;
         }
 
-        /// <summary>Return pooled buffers held by this writer.</summary>
         public void Dispose()
         {
             if (_disposed) return;
@@ -71,62 +66,54 @@ namespace Framedash
             _disposed = true;
         }
 
-        // ───── Low-level primitives ─────
 
-        /// <summary>Write a field tag (field number + wire type).</summary>
         public void WriteTag(int fieldNumber, int wireType)
         {
-            WriteVarint((ulong)((fieldNumber << 3) | wireType));
+            // Caller-supplied invalid tags must remain fail-safe in checked consumer builds.
+            WriteVarint(unchecked(((ulong)(uint)fieldNumber << 3) | (uint)wireType));
         }
 
-        /// <summary>Write an unsigned varint (base-128).</summary>
         public void WriteVarint(ulong value)
         {
             if (_disposed) return;
-            EnsureCapacity(10);
+            if (!EnsureCapacity(10)) return;
             while (value > 0x7F)
             {
-                _buffer[_length++] = (byte)(value | 0x80);
+                _buffer[_length++] = unchecked((byte)(value | 0x80));
                 value >>= 7;
             }
-            _buffer[_length++] = (byte)value;
+            _buffer[_length++] = unchecked((byte)value);
         }
 
-        /// <summary>Write 4 bytes in little-endian order.</summary>
         public void WriteFixed32(uint value)
         {
             if (_disposed) return;
-            EnsureCapacity(4);
-            _buffer[_length++] = (byte)value;
-            _buffer[_length++] = (byte)(value >> 8);
-            _buffer[_length++] = (byte)(value >> 16);
-            _buffer[_length++] = (byte)(value >> 24);
+            if (!EnsureCapacity(4)) return;
+            _buffer[_length++] = unchecked((byte)value);
+            _buffer[_length++] = unchecked((byte)(value >> 8));
+            _buffer[_length++] = unchecked((byte)(value >> 16));
+            _buffer[_length++] = unchecked((byte)(value >> 24));
         }
 
-        /// <summary>Write 8 bytes in little-endian order.</summary>
         public void WriteFixed64(ulong value)
         {
             if (_disposed) return;
-            EnsureCapacity(8);
-            _buffer[_length++] = (byte)value;
-            _buffer[_length++] = (byte)(value >> 8);
-            _buffer[_length++] = (byte)(value >> 16);
-            _buffer[_length++] = (byte)(value >> 24);
-            _buffer[_length++] = (byte)(value >> 32);
-            _buffer[_length++] = (byte)(value >> 40);
-            _buffer[_length++] = (byte)(value >> 48);
-            _buffer[_length++] = (byte)(value >> 56);
+            if (!EnsureCapacity(8)) return;
+            _buffer[_length++] = unchecked((byte)value);
+            _buffer[_length++] = unchecked((byte)(value >> 8));
+            _buffer[_length++] = unchecked((byte)(value >> 16));
+            _buffer[_length++] = unchecked((byte)(value >> 24));
+            _buffer[_length++] = unchecked((byte)(value >> 32));
+            _buffer[_length++] = unchecked((byte)(value >> 40));
+            _buffer[_length++] = unchecked((byte)(value >> 48));
+            _buffer[_length++] = unchecked((byte)(value >> 56));
         }
 
         /// <summary>Write raw bytes. Invalid ranges are ignored to keep SDK calls fail-safe.</summary>
         public void WriteRawBytes(byte[] data, int offset, int count)
         {
             if (_disposed || data == null) return;
-            if ((uint)offset > (uint)data.Length)
-            {
-                return;
-            }
-            if ((uint)count > (uint)(data.Length - offset))
+            if (offset < 0 || count < 0 || offset > data.Length - count)
             {
                 return;
             }
@@ -134,18 +121,15 @@ namespace Framedash
             WriteRawBytes(new ReadOnlySpan<byte>(data, offset, count));
         }
 
-        /// <summary>Write raw bytes from a non-allocating span.</summary>
         public void WriteRawBytes(ReadOnlySpan<byte> data)
         {
             if (_disposed) return;
-            EnsureCapacity(data.Length);
+            if (!EnsureCapacity(data.Length)) return;
             data.CopyTo(_buffer.AsSpan(_length, data.Length));
             _length += data.Length;
         }
 
-        // ───── Typed field writers (proto3 default-skipping) ─────
 
-        /// <summary>Write a string field. Skipped if null or empty (proto3 default).</summary>
         public void WriteString(int fieldNumber, string value)
         {
             if (string.IsNullOrEmpty(value)) return;
@@ -163,27 +147,20 @@ namespace Framedash
             WriteRawBytes(_utf8Buffer.AsSpan(0, byteCount));
         }
 
-        /// <summary>Write an int64 field as varint. Skipped if zero (proto3 default).</summary>
         public void WriteInt64(int fieldNumber, long value)
         {
             if (value == 0L) return;
             WriteTag(fieldNumber, WireVarint);
-            WriteVarint((ulong)value);
+            WriteVarint(unchecked((ulong)value));
         }
 
-        /// <summary>Write a float field (32-bit fixed). Skipped if zero (proto3 default).</summary>
         public void WriteFloat(int fieldNumber, float value)
         {
-            // ReSharper disable once CompareOfFloatsByEqualityOperator
             if (value == 0f) return;
             WriteTag(fieldNumber, Wire32Bit);
             WriteFixed32(FloatToUInt32(value));
         }
 
-        /// <summary>
-        /// Write a float field unconditionally, even when the value is 0.
-        /// For proto3 `optional` (presence-tracked) fields, where 0 is a real value.
-        /// </summary>
         public void WriteFloatPresent(int fieldNumber, float value)
         {
             if (_disposed) return;
@@ -191,24 +168,20 @@ namespace Framedash
             WriteFixed32(FloatToUInt32(value));
         }
 
-        /// <summary>Write a double field (64-bit fixed). Skipped if zero (proto3 default).</summary>
         public void WriteDouble(int fieldNumber, double value)
         {
-            // ReSharper disable once CompareOfFloatsByEqualityOperator
             if (value == 0.0) return;
             WriteTag(fieldNumber, Wire64Bit);
             WriteFixed64(DoubleToUInt64(value));
         }
 
-        /// <summary>Write an enum field as varint. Skipped if zero (proto3 default).</summary>
         public void WriteEnum(int fieldNumber, int value)
         {
             if (value == 0) return;
             WriteTag(fieldNumber, WireVarint);
-            WriteVarint((ulong)value);
+            WriteVarint(unchecked((ulong)value));
         }
 
-        /// <summary>Write an embedded message field. Skipped if sub-writer is empty.</summary>
         public void WriteSubMessage(int fieldNumber, ProtobufWriter sub)
         {
             if (_disposed || sub == null || sub._disposed) return;
@@ -218,12 +191,15 @@ namespace Framedash
             WriteRawBytes(sub._buffer.AsSpan(0, sub.Length));
         }
 
-        private void EnsureCapacity(int additionalBytes)
+        private bool EnsureCapacity(int additionalBytes)
         {
+            if (additionalBytes < 0 || additionalBytes > int.MaxValue - _length) return false;
             int required = _length + additionalBytes;
-            if (required <= _buffer.Length) return;
+            if (required <= _buffer.Length) return true;
 
-            int nextCapacity = _buffer.Length * 2;
+            int nextCapacity = _buffer.Length <= int.MaxValue / 2
+                ? _buffer.Length * 2
+                : required;
             if (nextCapacity < required)
             {
                 nextCapacity = required;
@@ -233,18 +209,18 @@ namespace Framedash
             Buffer.BlockCopy(_buffer, 0, nextBuffer, 0, _length);
             ArrayPool<byte>.Shared.Return(_buffer, clearArray: true);
             _buffer = nextBuffer;
+            return true;
         }
 
-        // ───── IEEE 754 bit conversion ─────
 
         private static uint FloatToUInt32(float value)
         {
-            return (uint)BitConverter.SingleToInt32Bits(value);
+            return unchecked((uint)BitConverter.SingleToInt32Bits(value));
         }
 
         private static ulong DoubleToUInt64(double value)
         {
-            return (ulong)BitConverter.DoubleToInt64Bits(value);
+            return unchecked((ulong)BitConverter.DoubleToInt64Bits(value));
         }
     }
 }

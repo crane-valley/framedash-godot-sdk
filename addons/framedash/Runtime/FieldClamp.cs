@@ -2,6 +2,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 
 namespace Framedash
 {
@@ -13,11 +14,10 @@ namespace Framedash
     /// silently drop every event in that flush. These helpers clamp each field to
     /// the ingest caps (packages/ingest-core/src/config.ts) before the event is
     /// buffered. Kept identical to the Unity SDK's FieldClamp so both C# engines
-    /// behave the same. No Godot references -- pure logic, NUnit-tested.
+    /// behave the same. No Godot references -- pure logic, NextUnit-tested.
     /// </summary>
     public static class FieldClamp
     {
-        // Must stay in sync with packages/ingest-core/src/config.ts.
         public const int MaxEventNameLength = 128;
         public const int MaxMapIdLength = 128;
         public const int MaxBuildIdLength = 128;
@@ -30,7 +30,6 @@ namespace Framedash
         public const float PositionAbsMax = 1e9f;
         public const float FpsMax = 1000f;
         public const float TimingMsMax = 10000f;
-        // Matches packages/ingest-core/src/config.ts MEMORY_USED_BYTES_MAX (64 GiB).
         public const long MaxMemoryUsedBytes = 64L * 1024L * 1024L * 1024L;
 
         /// <summary>
@@ -75,11 +74,6 @@ namespace Framedash
             return v;
         }
 
-        /// <summary>
-        /// Clamp a timing value (frame/gpu/render/game-thread ms) to the ingest
-        /// range [0, 10000]. NaN or negative maps to 0 (the proto contract treats
-        /// 0 as "not collected").
-        /// </summary>
         public static float ClampTimingMs(float v)
         {
             if (float.IsNaN(v) || v < 0f) return 0f;
@@ -108,12 +102,42 @@ namespace Framedash
         }
 
         /// <summary>
-        /// Convert an attributes dictionary to the serializable list form, enforcing
-        /// the ingest caps (count, key/value length). A null dictionary maps to a
-        /// null list -- callers rely on this "no attributes -> null" semantics. Entries
-        /// with a null/empty key are skipped; the count is capped at 50.
+        /// A null dictionary maps to a null list -- callers rely on this "no attributes ->
+        /// null" semantics. Entries with a null/empty key are skipped; the count is capped at
+        /// 50. Callers holding a dictionary whose VALUES are nullable should call
+        /// `ClampNullableValueAttributes` instead.
+        ///
+        /// NotNullIfNotNull on this and the two clamp helpers below: only a null dictionary
+        /// yields a null list, so a caller passing a statically non-null dictionary must not
+        /// have to null-check the result. A Godot addon's .cs files compile into the host
+        /// project, so without this a nullable-enabled game with TreatWarningsAsErrors fails to
+        /// build on an ordinary `.Count`.
         /// </summary>
+        [return: NotNullIfNotNull("attrs")]
         public static List<StringPair>? ClampAttributes(Dictionary<string, string>? attrs)
+            // Null-forgiving on the argument rather than an explicit cast: the two
+            // dictionary types are the SAME runtime type (value nullability is
+            // annotation-only metadata), a cast reports CS8619 instead of silencing
+            // anything, and the callee only READS values -- so widening the value
+            // annotation across this one call cannot be violated.
+            => ClampNullableValueAttributes(attrs!);
+
+        /// <summary>
+        /// <see cref="ClampAttributes"/> for callers whose dictionary VALUES are nullable
+        /// (deserialized JSON, a save file, an interop boundary). Identical clamps and
+        /// identical result; it is a separately named method rather than an overload
+        /// because C# cannot overload on the nullability of a type argument -- the two
+        /// signatures erase to the same parameter type (CS0111).
+        ///
+        /// Null-value semantics are unchanged from <see cref="ClampAttributes"/>: a null
+        /// VALUE becomes the empty string. The wire contract
+        /// (packages/proto/framedash/v1/telemetry.proto, map&lt;string, string&gt;) has no
+        /// null, and keeping the key with an empty value preserves the fact that the
+        /// game set that attribute, which dropping the entry would hide. A null or empty
+        /// KEY still skips the entry -- an attribute with no name cannot be queried.
+        /// </summary>
+        [return: NotNullIfNotNull("attrs")]
+        public static List<StringPair>? ClampNullableValueAttributes(Dictionary<string, string?>? attrs)
         {
             if (attrs == null) return null;
             var list = new List<StringPair>(Math.Min(attrs.Count, MaxAttributes));
@@ -128,13 +152,7 @@ namespace Framedash
             return list;
         }
 
-        /// <summary>
-        /// Convert a metrics dictionary to the serializable list form, enforcing the
-        /// ingest caps (count, key length) and dropping non-finite values. A null
-        /// dictionary maps to a null list -- callers rely on this "no metrics -> null"
-        /// semantics. Entries with a null/empty key or a NaN/Infinity value are
-        /// skipped; the count is capped at 50.
-        /// </summary>
+        [return: NotNullIfNotNull("metrics")]
         public static List<FloatPair>? ClampMetrics(Dictionary<string, float>? metrics)
         {
             if (metrics == null) return null;

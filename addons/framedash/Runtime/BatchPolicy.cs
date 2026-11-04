@@ -4,7 +4,7 @@ namespace Framedash
 {
     /// <summary>
     /// Pure batch-sizing policy for the telemetry transport. No engine
-    /// dependencies, so it is unit-testable under NUnit (TransportLayer itself is
+    /// dependencies, so it is unit-testable under NextUnit (TransportLayer itself is
     /// engine-coupled via Godot's HttpRequest and excluded from the test assembly).
     ///
     /// The split decision keys off the SERVER per-request caps, not the per-flush
@@ -14,11 +14,6 @@ namespace Framedash
     /// </summary>
     public static class BatchPolicy
     {
-        /// <summary>
-        /// Server-side per-request event cap (mirrors
-        /// packages/ingest-core/src/config.ts MAX_EVENTS_PER_BATCH). The consumer
-        /// rejects a batch with more events than this wholesale.
-        /// </summary>
         public const int MaxEventsPerBatch = 10000;
 
         /// <summary>
@@ -33,10 +28,6 @@ namespace Framedash
         /// </summary>
         public const int MaxDecodedEntries = 100000;
 
-        /// <summary>
-        /// Count the decoded entries in a batch the way the consumer does: one per
-        /// event plus one per attributes entry plus one per metrics entry.
-        /// </summary>
         public static int CountDecodedEntries(TelemetryEvent[]? events)
         {
             if (events == null) return 0;
@@ -71,15 +62,24 @@ namespace Framedash
                 || CountDecodedEntries(events) > MaxDecodedEntries;
         }
 
-        // Rough per-event fixed-field byte estimate (event name, ids, position,
-        // platform, engine version, timestamp, protobuf framing) for the blocking-drain
-        // pre-serialization size split. Deliberately generous so the estimate is not an
+        // Rough per-event byte estimate for the FIXED-SIZE parts only: numeric fields
+        // (position, timestamp, perf scalars) plus protobuf tag/length framing for every
+        // field. String field CONTENT is counted separately below at actual length x the
+        // UTF-8 worst case -- legal field values (128-char event name / map id / player id
+        // / build id, 64-char platform / engine version) can add ~2KB UTF-8 per event, far
+        // beyond any flat constant. Deliberately generous so the estimate is not an
         // undercount that lets an oversized chunk through.
         private const int EventBaseByteEstimate = 256;
-        // Protobuf key/length framing added per map entry on top of the key+value chars.
         private const int MapEntryOverheadBytes = 8;
-        // Per-metric entry beyond its key chars: the float value plus framing.
         private const int MetricEntryByteEstimate = 16;
+        // Protobuf serializes strings as UTF-8, but C# string.Length counts UTF-16 units.
+        // A BMP char (e.g. CJK) is one UTF-16 unit but up to 3 UTF-8 bytes, and a
+        // supplementary char is 2 UTF-16 units (a surrogate pair) at 4 UTF-8 bytes = 2
+        // bytes/unit, so 3 bytes per UTF-16 unit is a safe upper bound for both. Without
+        // this multiplier the estimate could undercount CJK-heavy content ~3x and let an
+        // uninterruptible serialize+gzip overrun MaxBlockingChunkBytes. Kept mirrored with
+        // the Unity/UE5 estimators.
+        private const int Utf8WorstCaseBytesPerUtf16Unit = 3;
 
         /// <summary>
         /// Max estimated UNCOMPRESSED bytes a single blocking-drain serialize+gzip may
@@ -95,8 +95,10 @@ namespace Framedash
         /// An attribute-heavy legal batch (up to <see cref="MaxDecodedEntries"/> map
         /// entries whose values can each be hundreds of chars) can otherwise be tens of
         /// MB, and a single uninterruptible serialize could overrun the drain budget.
-        /// String lengths are UTF-16 char counts, which track serialize/gzip CPU cost
-        /// closely enough for a chunking threshold.
+        /// String lengths are UTF-16 char counts scaled by
+        /// <see cref="Utf8WorstCaseBytesPerUtf16Unit"/> (protobuf serializes UTF-8), which
+        /// tracks serialize/gzip CPU cost closely enough for a chunking threshold without
+        /// undercounting CJK-heavy content.
         /// </summary>
         public static long EstimateSerializedBytes(TelemetryEvent[]? events)
         {
@@ -105,6 +107,22 @@ namespace Framedash
             for (int i = 0; i < events.Length; i++)
             {
                 total += EventBaseByteEstimate;
+                // Per-event string FIELDS, counted at actual length like the map entries
+                // (same x3 UTF-8 worst case). The base constant covers only fixed/numeric
+                // framing; a batch of legal max-length CJK field values would otherwise be
+                // underestimated by ~2KB UTF-8 per event and blow the serialize bound.
+                // Field set mirrors TelemetryEvent's string fields (and the Unity/UE5
+                // estimators): event name, session id, player id, map id, build id,
+                // platform, engine version.
+                var e = events[i];
+                total += Utf8WorstCaseBytesPerUtf16Unit
+                    * ((e.EventName != null ? e.EventName.Length : 0)
+                        + (e.SessionId != null ? e.SessionId.Length : 0)
+                        + (e.PlayerId != null ? e.PlayerId.Length : 0)
+                        + (e.MapId != null ? e.MapId.Length : 0)
+                        + (e.BuildId != null ? e.BuildId.Length : 0)
+                        + (e.Platform != null ? e.Platform.Length : 0)
+                        + (e.EngineVersion != null ? e.EngineVersion.Length : 0));
                 var attributes = events[i].Attributes;
                 var metrics = events[i].Metrics;
                 if (attributes != null)
@@ -113,8 +131,9 @@ namespace Framedash
                     {
                         string key = attributes[a].Key;
                         string value = attributes[a].Value;
-                        total += (key != null ? key.Length : 0)
-                            + (value != null ? value.Length : 0)
+                        // x3: UTF-16 units -> worst-case UTF-8 bytes (see the const comment).
+                        total += Utf8WorstCaseBytesPerUtf16Unit
+                                * ((key != null ? key.Length : 0) + (value != null ? value.Length : 0))
                             + MapEntryOverheadBytes;
                     }
                 }
@@ -123,7 +142,8 @@ namespace Framedash
                     for (int m = 0; m < metrics.Count; m++)
                     {
                         string key = metrics[m].Key;
-                        total += (key != null ? key.Length : 0) + MetricEntryByteEstimate;
+                        total += Utf8WorstCaseBytesPerUtf16Unit * (key != null ? key.Length : 0)
+                            + MetricEntryByteEstimate;
                     }
                 }
             }
@@ -131,10 +151,8 @@ namespace Framedash
         }
 
         /// <summary>
-        /// Whether a batch must be split BEFORE serialization on the blocking shutdown
-        /// drain to keep each serialize+gzip bounded (see <see cref="MaxBlockingChunkBytes"/>).
-        /// A single event is never split here: it cannot exceed the per-event server caps
-        /// by enough to matter, and there is nothing smaller to send.
+        /// A single event is never split here: it cannot exceed the per-event server caps by
+        /// enough to matter, and there is nothing smaller to send.
         /// </summary>
         public static bool ExceedsBlockingChunkBytes(TelemetryEvent[]? events)
         {

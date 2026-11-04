@@ -6,6 +6,75 @@ follows [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-11-04
+
+### Added
+
+- Add `FieldClamp.ClampNullableValueAttributes(Dictionary<string, string?>?)`: the same
+  attribute clamping as `ClampAttributes`, for callers whose dictionary VALUES are
+  nullable (deserialized JSON, a save file, an interop boundary). Previously such a
+  caller had to null-forgive the dictionary or accept a CS8620 nullability warning.
+  Behavior is unchanged in both entry points -- a null value is serialized as the
+  empty string, and a null or empty key still skips the entry. It is a separately
+  named method rather than an overload because C# erases the nullability of a type
+  argument, so a second `ClampAttributes` differing only in value nullability cannot
+  be declared. No wire-format change and no version bump; `ClampAttributes` keeps its
+  signature and now forwards to the new method. Kept in step with the Unity SDK.
+
+- Add `TelemetrySDK.FlushBlocking(int timeoutMs)`, an optional public synchronous
+  flush for moments a game can afford a short block (level end, pre-quit). It
+  blocks the main thread until every event buffered at call time -- including any
+  unconfirmed in-flight async batch -- is confirmed delivered, or the budget
+  elapses. Unlike the best-effort shutdown drain it is NON-DESTRUCTIVE: events not
+  confirmed within the budget stay buffered for the periodic async flush to retry,
+  so nothing is lost. The no-loss guarantee covers timeouts and transient failures
+  (5xx / 429 / network); a permanent server rejection (3xx / non-retryable 4xx such
+  as 401/400) is dropped by transport policy -- re-sending it could never succeed,
+  so requeuing would poison the buffer forever -- and is surfaced by returning
+  false. Returns true only when everything was confirmed (or there was nothing to
+  send); returns false on timeout, a transient or permanent transport failure, a
+  disabled or uninitialized SDK, `timeoutMs <= 0`, or an off-main-thread call.
+  A confirmation that arrives only after the budget elapsed is still acknowledged
+  (the batch is kept as delivered, not resent); the `false` in that case reports
+  only the budget overrun. `timeoutMs` is clamped to at most 30000. Never throws.
+- Add engine-independent NUnit coverage for the flush-blocking timeout fast-fail,
+  budget clamp, buffered-envelope partitioning on partial delivery, and the no-loss
+  re-enqueue decision (buffered re-enqueued on failure; the in-flight batch left to
+  the async flush to avoid a non-dedupable duplicate).
+
+### Changed
+
+- `memory_used_bytes` now falls back to `GC.GetTotalMemory(false)` when Godot's
+  `Performance.MemoryStatic` monitor is unavailable, as it commonly is in
+  exported release builds. The field remains engine static memory when that
+  monitor returns a positive reading. Because the wire event does not identify
+  which source supplied the value, compare it only across matching
+  export/runtime configurations; changing source can otherwise resemble a
+  memory regression.
+- `FieldClamp.ClampAttributes` and `FieldClamp.ClampMetrics` now carry
+  `[return: NotNullIfNotNull(...)]`, matching the Unity SDK. Only a null dictionary
+  ever yields a null list, so a nullable-enabled game passing a non-null dictionary
+  no longer warns (CS8602) on an ordinary `.Count` -- which mattered here because an
+  addon's `.cs` files compile into the host project, so the warning could fail a
+  build using `TreatWarningsAsErrors`. Annotation only: no behavior change.
+- The in-editor heatmap overlay now requests `coordinates=world` and renders Y-up
+  maps on the engine X/Z ground with height along Y. The Z Offset control is
+  renamed Height Offset and moves along the map's active up axis (Y for Y-up
+  maps). Click Refresh Maps after changing a
+  map's up axis in the dashboard.
+
+### Fixed
+
+- The shared editor JSON reader rejects more than 64 nested containers before
+  recursion can exhaust the stack. Wide map and heatmap responses remain supported.
+
+- Bound the optional server-clock bootstrap across all address families rather
+  than granting each family a fresh timeout. Blocking flushes now reserve at
+  least half of short caller budgets for the telemetry POST (and skip HEAD for a
+  one-millisecond budget), and a seized in-flight envelope is restamped in place
+  before blocking serialization so a concurrent pre-quit flush cannot retain an
+  invalid client timestamp.
+
 ## [0.1.8] - 2026-07-24
 
 ### Added

@@ -1,9 +1,5 @@
 namespace Framedash
 {
-    /// <summary>
-    /// Pure flush decision logic extracted from TelemetrySDK.
-    /// No engine dependencies -- testable with NUnit.
-    /// </summary>
     public sealed class FlushPolicy
     {
         public int MaxBatchSize { get; }
@@ -23,27 +19,16 @@ namespace Framedash
             BytesPerEventEstimate = bytesPerEventEstimate > 0 ? bytesPerEventEstimate : 500;
         }
 
-        /// <summary>
-        /// Estimate the payload size in bytes for the given event count.
-        /// </summary>
         public int EstimatePayloadBytes(int eventCount)
         {
             return eventCount * BytesPerEventEstimate;
         }
 
-        /// <summary>
-        /// Whether a flush should be requested immediately after Track().
-        /// Triggered when event count reaches batch size or estimated payload reaches limit.
-        /// </summary>
         public bool ShouldRequestFlush(int eventCount, int estimatedBytes)
         {
             return eventCount >= MaxBatchSize || estimatedBytes >= MaxPayloadBytes;
         }
 
-        /// <summary>
-        /// Whether the flush loop should trigger a flush based on time elapsed
-        /// or a pending flush request.
-        /// </summary>
         public bool ShouldFlush(bool flushRequested, float elapsedSeconds)
         {
             return flushRequested || elapsedSeconds >= FlushIntervalSeconds;

@@ -23,9 +23,6 @@ namespace Framedash
             public float GpuTimeMs;
             public float GameThreadMs;
             public float RenderThreadMs;
-            // Raw GPU-memory monitor readings (bytes); 0 if unavailable/uncollected.
-            // MemMetricsBuilder decides omission (a raw 0 here never becomes a
-            // stuffed mem.* metric).
             public double VramBytes;
             public double TexturesBytes;
             public double BuffersBytes;
@@ -43,7 +40,6 @@ namespace Framedash
         // reports its true low rate rather than the clamped frame time's 0.1 fps.
         private float _fps;
 
-        // Cached per-frame values from the rendering / performance monitors.
         private float _cachedGpuTimeMs;
         private float _cachedGameThreadMs;
         private float _cachedRenderThreadMs;
@@ -82,7 +78,6 @@ namespace Framedash
         {
             lock (_lock)
             {
-                // Wall-clock frame delta (microseconds), independent of Engine.TimeScale.
                 try
                 {
                     ulong nowUs = Time.GetTicksUsec();
@@ -113,11 +108,10 @@ namespace Framedash
                 if (!_measureEnabled)
                 {
                     try { RenderingServer.ViewportSetMeasureRenderTime(viewportRid, true); }
-                    catch { /* leave disabled; GPU/render times stay 0 = not collected */ }
+                    catch {   }
                     _measureEnabled = true;
                 }
 
-                // GPU render time for the main viewport (best-effort; ms).
                 try
                 {
                     float gpu = (float)RenderingServer.ViewportGetMeasuredRenderTimeGpu(viewportRid);
@@ -130,7 +124,6 @@ namespace Framedash
                     _cachedGpuTimeMs = 0f;
                 }
 
-                // CPU-side render time for the main viewport (the render thread; ms).
                 try
                 {
                     float render = (float)RenderingServer.ViewportGetMeasuredRenderTimeCpu(viewportRid);
@@ -153,16 +146,15 @@ namespace Framedash
                     _cachedGameThreadMs = 0f;
                 }
 
-                // Godot's tracked STATIC memory (Performance.Monitor.MemoryStatic), not the
-                // full process RSS -- analogous to Unity's Profiler.GetTotalAllocatedMemoryLong().
-                // Sampled here on the main thread (alongside the other native probes) so the
-                // off-thread Track() -> Collect() path reads only a cached primitive.
+                // MemoryStatic is unavailable in exported release builds. The managed heap
+                // fallback keeps production telemetry useful without process APIs that are
+                // unsupported on Godot's mobile targets.
                 try
                 {
-                    long mem = (long)Performance.GetMonitor(Performance.Monitor.MemoryStatic);
-                    // Clamp to the ingest range [0, 64 GiB]: a negative/garbage reading or
-                    // an oversized value would otherwise be rejected, dropping the batch.
-                    _cachedMemoryUsedBytes = FieldClamp.ClampMemory(mem);
+                    long godotStatic = (long)Performance.GetMonitor(Performance.Monitor.MemoryStatic);
+                    long managedHeap = System.GC.GetTotalMemory(false);
+                    _cachedMemoryUsedBytes =
+                        GodotRuntimePolicy.SelectMemoryUsedBytes(godotStatic, managedHeap);
                 }
                 catch
                 {
@@ -184,7 +176,6 @@ namespace Framedash
             }
         }
 
-        /// <summary>Collect current frame performance data using cached timings.</summary>
         public PerfSnapshot Collect()
         {
             // Memory was sampled on the main thread in UpdateFrameTimings and cached, so
@@ -194,8 +185,6 @@ namespace Framedash
             {
                 return new PerfSnapshot
                 {
-                    // FPS derived from the real-time (unscaled) RAW frame delta in
-                    // UpdateFrameTimings, capped to the ingest ceiling (1000).
                     Fps = _fps,
                     FrameTimeMs = _frameTimeMs,
                     MemoryUsedBytes = _cachedMemoryUsedBytes,

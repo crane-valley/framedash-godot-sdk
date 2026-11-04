@@ -18,7 +18,6 @@ namespace Framedash
         private readonly Dictionary<string, float> _eventRates = new Dictionary<string, float>(System.StringComparer.Ordinal);
         private float _rate;
 
-        /// <summary>Default sampling rate when no per-event override exists (0.0 = drop all, 1.0 = keep all).</summary>
         public float Rate
         {
             get { lock (_ratesLock) { return _rate; } }
@@ -30,10 +29,6 @@ namespace Framedash
             Rate = rate;
         }
 
-        /// <summary>
-        /// Set a per-event-name sampling rate that overrides the global rate for the given event name.
-        /// Null/empty event names are ignored. Rate is clamped to [0, 1].
-        /// </summary>
         public void SetEventRate(string? eventName, float rate)
         {
             if (string.IsNullOrEmpty(eventName)) return;
@@ -52,8 +47,8 @@ namespace Framedash
         }
 
         /// <summary>
-        /// Returns true if this event should be kept. Uses a per-event-name rate if one is set
-        /// for <paramref name="eventName"/>, otherwise falls back to the global rate.
+        /// Uses a per-event-name rate if one is set for `eventName`, otherwise falls back to
+        /// the global rate.
         /// </summary>
         public bool ShouldSample(string? eventName)
         {

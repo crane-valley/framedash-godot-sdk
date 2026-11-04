@@ -8,9 +8,9 @@ namespace Framedash
     /// Engine-independent UUIDv7 (RFC 9562) generator with a Xoshiro256++
     /// PRNG. Mirrors the UE5 SDK's Framedash::PackUuidV7 / FXoshiro256pp
     /// (sdks/ue5/.../FramedashUuid.{h,cpp}) so session IDs share a single
-    /// algorithm across SDKs. The custom path is kept because Godot's
-    /// .NET 8 runtime predates .NET 9's Guid.CreateVersion7, and a shared
-    /// algorithm keeps session IDs identical across the SDKs.
+    /// algorithm across SDKs. The custom path supports both Unity's
+    /// Mono / IL2CPP runtimes and Godot runtimes that predate .NET 9's
+    /// Guid.CreateVersion7.
     ///
     /// Telemetry / correlation IDs only. Xoshiro256++ is statistically
     /// strong but not a CSPRNG, so the generated IDs MUST NOT be used as
@@ -18,19 +18,13 @@ namespace Framedash
     /// relies on unguessability. Use System.Security.Cryptography for
     /// those.
     ///
-    /// Pure C# (no engine references) so it compiles into the
-    /// standalone NUnit harness in sdks/godot/Tests/ without a Godot
-    /// install.
+    /// Pure C# (no engine references) so it compiles into both standalone
+    /// NextUnit harnesses without an engine install.
     /// </summary>
     public static class SessionIdGenerator
     {
         [ThreadStatic] private static Xoshiro256PlusPlus? s_rng;
 
-        /// <summary>
-        /// Generate a fresh UUIDv7 string in canonical 8-4-4-4-12 lower-hex
-        /// form. Safe to call from any thread; each thread lazily seeds
-        /// its own ThreadStatic Xoshiro instance.
-        /// </summary>
         public static string NewSessionIdV7()
         {
             ulong unixTsMs = ClampNonNegativeUnixMs(
@@ -60,10 +54,9 @@ namespace Framedash
         /// Unix epoch (vanishingly rare on a real device). Returning
         /// 0 instead of casting silently lets the resulting v7 ID still
         /// parse with an all-zero timestamp prefix until the clock
-        /// recovers. Throwing here would violate the SDK's
-        /// "NEVER throw" hard rule. Internal so the standalone NUnit
-        /// harness can verify the clamp without forcing a pre-epoch
-        /// system clock.
+        /// recovers. Throwing here would violate the SDK's "NEVER throw"
+        /// hard rule. Internal so the standalone NextUnit harness can verify
+        /// the clamp without forcing a pre-epoch system clock.
         /// </summary>
         internal static ulong ClampNonNegativeUnixMs(long unixMsSigned)
         {
@@ -105,9 +98,8 @@ namespace Framedash
         }
 
         /// <summary>
-        /// Microsoft Guid 4x32 layout that, when stringified via
-        /// ToString("D"), produces the canonical 8-4-4-4-12 hex defined by
-        /// RFC 9562. Field naming matches the UE5 FUuidFields struct.
+        /// The fields must agree with the UE5 FUuidFields layout so both SDKs produce the same
+        /// RFC 9562 UUID representation.
         /// </summary>
         public readonly struct UuidV7Fields
         {
@@ -144,18 +136,6 @@ namespace Framedash
             }
         }
 
-        /// <summary>
-        /// Pack a UUIDv7 (RFC 9562) from a millisecond timestamp and 128
-        /// bits of random material. Bit layout (MSB first):
-        ///   bits   0..47  unix_ts_ms (input is truncated to 48 bits)
-        ///   bits  48..51  ver = 0x7
-        ///   bits  52..63  rand_a (12 bits, taken from R1[0..11])
-        ///   bits  64..65  var = 0b10
-        ///   bits  66..127 rand_b (62 bits)
-        /// Of R1 the low 26 bits are consumed (12 for rand_a, 14 for the
-        /// high half of rand_b). Of R2 the low 32 bits and bits 32..47
-        /// fill the rest of rand_b. Remaining input bits are ignored.
-        /// </summary>
         public static UuidV7Fields PackUuidV7(ulong unixTsMs, ulong r1, ulong r2)
         {
             unixTsMs &= 0x0000FFFFFFFFFFFFUL;

@@ -2,6 +2,12 @@
 
 Godot 4.3+ C# addon for collecting game telemetry and sending it to the Framedash platform.
 
+## Use cases
+
+- **Game telemetry:** capture custom gameplay events, 3D positions, automatic performance metrics, and build/session metadata.
+- **Heatmap analytics:** explore cloud-aggregated player and performance hotspots in the Framedash dashboard or directly in the Godot 3D editor.
+- **Performance regression CI:** label automated runs by build, compare candidates with `framedash perf-diff`, and fail CI when a configured regression threshold is exceeded.
+
 ## Requirements
 
 - Godot 4.3 or newer with the **.NET (C#)** build (the editor download labeled "mono"). The standard (GDScript-only) Godot build cannot compile the addon's C# sources. Developed and verified against Godot 4.6.3.
@@ -22,17 +28,17 @@ Godot 4.3+ C# addon for collecting game telemetry and sending it to the Framedas
 
 After the first build, enabling the plugin registers a **Framedash** autoload singleton automatically, so the SDK node is created and persists for the lifetime of the game. There is no separate scene wiring to do.
 
-> **Test sources are intentionally excluded from this public distribution.** The private monorepo keeps NUnit tests and a `Godot.GD` stub under `Tests/` for SDK development. They are omitted from the public mirror because a Godot .NET project would compile them into the game assembly, pulling in unavailable NUnit packages and conflicting with the real `Godot.GD` type. There is no `Tests/` folder in the mirror download to remove before shipping.
+> **Test sources are intentionally excluded from this public distribution.** The private monorepo keeps NextUnit tests and a `Godot.GD` stub under `Tests/` for SDK development. They are omitted from the public mirror because a Godot .NET project would compile them into the game assembly, pulling in unavailable NextUnit packages and conflicting with the real `Godot.GD` type. There is no `Tests/` folder in the mirror download to remove before shipping.
 
 ## Components
 
 | File | Description |
 |------|-------------|
-| `TelemetrySDK.cs` | Main entry point — initialization, configuration, session lifecycle, autoload `Node` |
+| `TelemetrySDK*.cs` | Main entry point — initialization, tracking, flushing, session lifecycle, autoload `Node` |
 | `TelemetryEvent.cs` | Event data model |
 | `TelemetrySerializer.cs` | Event serialization |
 | `ProtobufWriter.cs` | Protobuf binary encoding |
-| `TransportLayer.cs` | HTTPS transport with gzip compression |
+| `TransportLayer*.cs` | HTTPS transport with gzip compression and bounded shutdown drain |
 | `SessionManager.cs` | Session ID and metadata management |
 | `PerformanceCollector.cs` | Automatic FPS, frame time, memory, GPU/render/process time collection |
 | `SamplingPolicy.cs` | Configurable event sampling and throttling |
@@ -70,6 +76,14 @@ per-project `.godot/editor/editor_layout.cfg` metadata, not `project.godot`.
 Keep `.godot/` excluded from version control. All heatmap code is guarded by
 `TOOLS`, so it and the read key are excluded from exported games.
 
+The SDK still records raw Godot `Vector3` positions. Register the map as Y-up
+via the dashboard Upload Map "Up axis" select or the CLI sidecar (`up_axis: "y"`
+with `"version": "1.1"`) so the dashboard bins X/Z and the overlay draws on the
+X/Z ground with height along Y. After changing a map's up axis, choose **Refresh
+Maps** in the dock. **Height Offset** moves along Y for Y-up maps and remains only a
+display translation. A Godot top-down capture has -Z up (right-handed), so flip
+it vertically before upload; there is no automatic flip.
+
 ## Automatic Events
 
 The SDK automatically sends the following events with `Source=Automated`. These bypass sampling policy and always fire regardless of the configured sampling rate.
@@ -86,17 +100,25 @@ Both events include full performance metrics from `PerformanceCollector`.
 `PerformanceCollector.cs` reads from Godot's engine APIs:
 
 - **FPS and frame time** — computed from the real (wall-clock) frame delta measured via `Time.GetTicksUsec()`, so the values are independent of any in-game time scaling (`Engine.TimeScale`).
-- **Memory** — `Performance.MemoryStatic` for the static memory used by the engine.
+- **Memory** — `Performance.MemoryStatic` for the static memory used by the
+  engine when Godot exposes it; otherwise the managed GC heap from
+  `GC.GetTotalMemory(false)`.
 - **GPU and render-CPU time** — measured via `RenderingServer` (the GPU and CPU times the renderer reports for the last frame), converted to milliseconds.
 - **Game-thread (process) time** — `Performance.TimeProcess` for the time spent in the game's `_process` step.
 
-Any metric that the platform or build cannot report is left as `0`, which the wire contract treats as "not collected" (it is not a measured zero).
+`memory_used_bytes` is therefore a best-available runtime-memory indicator, not
+a single cross-build measurement source. Exported release builds commonly use
+the managed-heap fallback because Godot reports `MemoryStatic` as unavailable.
+The event does not carry a source tag, so compare this field only between builds
+with the same export/runtime configuration; a switch between the engine-static
+and managed-heap sources can look like a memory change. Other performance
+metrics that the platform or build cannot report are left as `0`, which the
+wire contract treats as "not collected" (it is not a measured zero).
 
 ## GPU Memory Metrics (Automatic)
 
-In addition to `Performance.MemoryStatic` (the `memory_used_bytes` field above),
-the SDK also samples three GPU-memory monitors and attaches them to the metrics
-map as bytes:
+In addition to the best-available `memory_used_bytes` field above, the SDK also
+samples three GPU-memory monitors and attaches them to the metrics map as bytes:
 
 - `metrics["mem.vram"]` — `Performance.Monitor.RenderVideoMemUsed`
 - `metrics["mem.textures"]` — `Performance.Monitor.RenderTextureMemUsed`
@@ -259,7 +281,7 @@ GPU metrics. A per-event attribute with the same key overrides the session value
 
 If your CI harness exports the standard Framedash variables (`FRAMEDASH_BUILD_ID`,
 `FRAMEDASH_GIT_BRANCH`, `FRAMEDASH_GIT_COMMIT`, `FRAMEDASH_TEST_SCENARIO`) -- the
-planned `framedash run-profile-test` runner will export these for you -- call the
+`framedash run-profile-test` runner exports these for you -- call the
 zero-argument overload instead:
 
 ```csharp
@@ -281,6 +303,41 @@ Two things to know when wiring this into a real pipeline:
   projects strip on ingest -- under COPPA only `build_id` survives. If you run
   automated profiling on a COPPA project, make `build_id` carry everything the
   comparison must distinguish.
+
+### 7. Synchronous flush (level end / pre-quit)
+
+`Flush()` is asynchronous and returns immediately. At a moment your game can
+afford a short block -- the end of a level, or just before quitting -- you can
+instead wait for delivery with `FlushBlocking`:
+
+```csharp
+// Block for up to 5s waiting for confirmed delivery. Returns true only if
+// everything buffered at call time was delivered within the budget.
+bool delivered = Framedash.TelemetrySDK.Instance.FlushBlocking(5000);
+```
+
+It blocks the calling (main) thread until every event buffered at call time --
+including any unconfirmed in-flight async batch -- is confirmed delivered, or the
+budget elapses. Guarantees:
+
+- **Non-destructive.** Unlike shutdown, events not confirmed within the budget
+  stay buffered for the normal periodic flush to retry later -- nothing is lost.
+  This no-loss guarantee covers timeouts and transient failures (5xx, 429,
+  network). A **permanent** server rejection (3xx, or a non-retryable 4xx such as
+  `401`/`400`) is the exception: re-sending it could never succeed, so those
+  events are dropped by transport policy rather than requeued forever, and the
+  drop is surfaced by returning `false`.
+- **Bounded block.** `timeoutMs` is clamped to at most `30000`; the call never
+  blocks meaningfully past the budget, so a wedged endpoint cannot hang the game.
+  If a delivery confirmation arrives only after the budget elapsed, the batch is
+  still acknowledged (kept as delivered, not resent) but the call returns `false`
+  -- the `false` reports only that confirmation did not arrive within the budget.
+- **Never throws.** Returns `false` (rather than raising) on timeout, a transient
+  or permanent transport failure, a disabled or uninitialized SDK, `timeoutMs <=
+  0`, or a call made off the main thread.
+
+Call it only from the main thread; an off-main-thread call logs a warning and
+returns `false` instead of blocking.
 
 ## Local Development
 

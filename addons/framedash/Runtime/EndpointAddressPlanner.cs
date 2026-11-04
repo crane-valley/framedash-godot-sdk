@@ -7,8 +7,8 @@ using System.Linq;
 namespace Framedash
 {
     /// <summary>
-    /// Address family for a delivery attempt. Kept engine-independent (does not
-    /// reference Godot's IP.Type) so the ordering/URL-rewrite logic is NUnit-testable.
+    /// Address family for a delivery attempt. Kept engine-independent so the
+    /// ordering and URL-rewrite logic are NextUnit-testable.
     /// </summary>
     public enum IpFamily
     {
@@ -17,14 +17,9 @@ namespace Framedash
     }
 
     /// <summary>
-    /// Immutable delivery plan produced by <see cref="EndpointAddressPlanner"/>: the
-    /// ordered IP-literal URLs to attempt (IPv4 preferred, IPv6 fallback) plus the
-    /// Host header and TLS common-name override that make an IP-literal connect still
-    /// route and validate as the original FQDN.
-    ///
-    /// A "passthrough" plan (<see cref="IsPassthrough"/>) carries the single original
-    /// URL with no host rewrite -- used for loopback / IP-literal / non-HTTPS endpoints,
-    /// or when DNS resolution yielded nothing, so the engine resolves normally.
+    /// A "passthrough" plan (`IsPassthrough`) carries the single original URL with no host
+    /// rewrite -- used for loopback / IP-literal / non-HTTPS endpoints, or when DNS resolution
+    /// yielded nothing, so the engine resolves normally.
     /// </summary>
     public sealed class EndpointAddressPlan
     {
@@ -39,25 +34,18 @@ namespace Framedash
 
         /// <summary>
         /// Explicit Host header value ("host" or "host:port"). Empty for a passthrough
-        /// plan. When set, the transport sends it so Godot's HTTPClient does not inject
-        /// its own Host = the IP literal (which Cloudflare Worker route-matching needs to
-        /// be the hostname).
+        /// plan. When set, the transport sends it so the request routes as the hostname,
+        /// not the IP literal, which Cloudflare Worker route matching requires.
         /// </summary>
         public string HostHeader { get; }
 
         /// <summary>
-        /// TLS common-name override (the FQDN). Empty for a passthrough plan. Drives
-        /// mbedtls_ssl_set_hostname, which sets BOTH the SNI extension and the
-        /// certificate-verification name, so a connect to an IP literal still negotiates
-        /// and validates against the real hostname.
+        /// TLS common-name override (the FQDN). Empty for a passthrough plan. The
+        /// transport uses it for both SNI and certificate verification so a connect to
+        /// an IP literal still negotiates and validates against the real hostname.
         /// </summary>
         public string CommonName { get; }
 
-        /// <summary>
-        /// True when no host rewrite applies: use the original URL and let the engine
-        /// resolve/validate normally (loopback, IP-literal, or non-HTTPS endpoints, or a
-        /// total resolution failure). Derived from an empty <see cref="CommonName"/>.
-        /// </summary>
         public bool IsPassthrough => CommonName.Length == 0;
 
         public EndpointAddressPlan(IReadOnlyList<string> attemptUrls, string hostHeader, string commonName)
@@ -73,9 +61,9 @@ namespace Framedash
 
     /// <summary>
     /// Pure, engine-independent planner for the prefer-IPv4-with-IPv6-fallback ingest
-    /// connect. It never calls engine APIs (the caller performs the actual DNS
-    /// resolution via Godot's IP.ResolveHostname and passes the results in), so the
-    /// address-family ordering and URL-rewrite logic can be unit-tested under NUnit.
+    /// connect. It never resolves DNS itself: the engine-specific caller performs
+    /// resolution and passes the results in, so address-family ordering and URL rewrite
+    /// behavior can be unit-tested under NextUnit.
     /// </summary>
     public static class EndpointAddressPlanner
     {
@@ -87,9 +75,8 @@ namespace Framedash
             Array.AsReadOnly(new[] { IpFamily.IPv4, IpFamily.IPv6 });
 
         /// <summary>
-        /// Whether the forced-IP-literal path applies to this endpoint at all. Only real
-        /// remote HTTPS hostnames benefit; loopback / IP-literal / non-HTTPS endpoints
-        /// (plain HTTP is already loopback-only per EndpointSecurity) pass through
+        /// Only real remote HTTPS hostnames benefit; loopback / IP-literal / non-HTTPS
+        /// endpoints (plain HTTP is already loopback-only per EndpointSecurity) pass through
         /// unchanged so local dev and self-hosted-by-IP deployments keep working.
         /// </summary>
         public static bool ShouldForceAddressFamily(string? endpointUrl)
@@ -106,11 +93,10 @@ namespace Framedash
         }
 
         /// <summary>
-        /// Build the delivery plan. <paramref name="resolvedIPv4"/> /
-        /// <paramref name="resolvedIPv6"/> are the first resolved address of each family
-        /// (empty when that family did not resolve). When the endpoint is passthrough or
-        /// neither family resolved, returns a passthrough plan on the original URL so the
-        /// engine resolves normally rather than the SDK dropping the batch.
+        /// `resolvedIPv4` / `resolvedIPv6` are the first resolved address of each family (empty
+        /// when that family did not resolve). When the endpoint is passthrough or neither
+        /// family resolved, returns a passthrough plan on the original URL so the engine
+        /// resolves normally rather than the SDK dropping the batch.
         /// </summary>
         public static EndpointAddressPlan Build(string endpointUrl, string? resolvedIPv4, string? resolvedIPv6)
         {
@@ -129,7 +115,8 @@ namespace Framedash
                 return Passthrough(endpointUrl);
 
             var uri = new Uri(endpointUrl);
-            return new EndpointAddressPlan(urls, HostHeaderValue(endpointUrl), uri.Host);
+            string hostHeader = uri.IsDefaultPort ? uri.Host : uri.Host + ":" + uri.Port;
+            return new EndpointAddressPlan(urls, hostHeader, uri.Host);
         }
 
         /// <summary>
@@ -143,16 +130,13 @@ namespace Framedash
         public static int NextFamily(int currentIndex, int attemptUrlCount)
         {
             if (attemptUrlCount <= 0) return 0;
-            return (currentIndex + 1) % attemptUrlCount;
+            long next = ((long)currentIndex + 1) % attemptUrlCount;
+            return (int)(next < 0 ? next + attemptUrlCount : next);
         }
 
         private static EndpointAddressPlan Passthrough(string endpointUrl) =>
             new EndpointAddressPlan(new[] { endpointUrl }, string.Empty, string.Empty);
 
-        /// <summary>
-        /// Rewrite the authority host of <paramref name="endpointUrl"/> with an IP
-        /// literal (bracketing IPv6), preserving scheme, port, path, query, and fragment.
-        /// </summary>
         public static string RewriteHost(string endpointUrl, string ipLiteral, IpFamily family)
         {
             // Defensive (public API): a null/empty IP literal has nothing to substitute,
@@ -181,8 +165,8 @@ namespace Framedash
             return uri.IsDefaultPort ? uri.Host : uri.Host + ":" + uri.Port;
         }
 
-        // Godot's IP.ResolveHostname returns a bare IPv6 (no brackets); guard against a
-        // caller that already bracketed so RewriteHost never emits "[[..]]".
+        // Resolvers return a bare IPv6 literal without brackets; guard against a caller
+        // that already bracketed so RewriteHost never emits "[[..]]".
         private static string StripBrackets(string ip)
         {
             if (ip.Length >= 2 && ip[0] == '[' && ip[ip.Length - 1] == ']')

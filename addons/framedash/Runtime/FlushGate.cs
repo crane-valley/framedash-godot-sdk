@@ -27,17 +27,14 @@ namespace Framedash
 	/// </summary>
 	public sealed class FlushGate
 	{
-		// High 32 bits: generation. Low 32 bits: in-flight flag (0 = idle, 1 = flushing).
 		private long _state;
 
 		private static int GenerationOf(long state) => (int)(state >> 32);
 		private static int FlagOf(long state) => (int)(state & 0xFFFFFFFFL);
 		private static long Pack(int generation, int flag) => ((long)generation << 32) | (uint)flag;
 
-		/// <summary>The current flush generation (incremented on each re-init).</summary>
 		public int Generation => GenerationOf(Interlocked.Read(ref _state));
 
-		/// <summary>Whether a flush is currently in flight.</summary>
 		public bool IsFlushing => FlagOf(Interlocked.Read(ref _state)) == 1;
 
 		/// <summary>
@@ -55,10 +52,6 @@ namespace Framedash
 			}
 		}
 
-		/// <summary>
-		/// Unconditionally release the gate (keeping the current generation). Used on
-		/// the synchronous early-return / error paths inside the same Flush() call.
-		/// </summary>
 		public void Release()
 		{
 			while (true)
@@ -81,8 +74,8 @@ namespace Framedash
 			while (true)
 			{
 				long state = Interlocked.Read(ref _state);
-				if (GenerationOf(state) != generation) return; // stale: new session owns the gate
-				if (FlagOf(state) == 0) return;                // already released
+				if (GenerationOf(state) != generation) return;
+				if (FlagOf(state) == 0) return;
 				long next = Pack(generation, 0);
 				if (Interlocked.CompareExchange(ref _state, next, state) == state) return;
 				// CAS failed: state changed concurrently -- re-read and re-evaluate.
