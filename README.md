@@ -95,6 +95,14 @@ The SDK automatically sends the following events with `Source=Automated`. These 
 
 Both events include full performance metrics from `PerformanceCollector`.
 
+## Automatic Flush
+
+The SDK requests a flush at 100 buffered events, after 30 seconds, or when its
+payload estimate reaches 102,400 bytes. The estimate is a fixed 500 bytes per
+event; it does not measure attribute text, encoded Protobuf, or gzip bytes.
+With the defaults, the 100-event trigger fires before the size estimate reaches
+its limit.
+
 ## Performance Collection
 
 `PerformanceCollector.cs` reads from Godot's engine APIs:
